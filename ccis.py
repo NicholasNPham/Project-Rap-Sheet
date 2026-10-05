@@ -28,6 +28,7 @@ venire has this same behaviour and runs clean, so it is kept as-is rather than
 
 import base64
 import time
+from typing import NamedTuple
 
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
@@ -41,6 +42,22 @@ from exceptions import RowProblem, SystemProblem
 from logger import get_logger
 
 logger = get_logger(__name__)
+
+
+class CcisResult(NamedTuple):
+    """What one CCIS search produced.
+
+    Every search now ends in a PDF: the case summary when CCIS has a record,
+    or the printed 'No matches found.' page when it does not. Both are filed
+    to STAC, so has_record is what tells the two apart.
+
+    Attributes:
+        pdf_bytes: The captured PDF.
+        has_record: False when the PDF is the no-results page.
+    """
+
+    pdf_bytes: bytes
+    has_record: bool
 
 # Chrome DevTools Protocol, for a PDF with no print dialog.
 PRINT_TO_PDF_COMMAND = "Page.printToPDF"
@@ -238,8 +255,8 @@ class CcisSession:
 
     # --------------------------------------------------------------- one row
 
-    def fetch_pdf(self, first_name: str, last_name: str, dob: str) -> bytes | None:
-        """Search for one person and return their case summary as PDF bytes.
+    def fetch_pdf(self, first_name: str, last_name: str, dob: str) -> CcisResult:
+        """Search for one person and return a PDF of what CCIS showed.
 
         The search page is always left reset, whether a record was found, no
         record was found, or something failed partway through. venire does this
@@ -252,8 +269,11 @@ class CcisSession:
             dob: mm/dd/yyyy, ex '04/23/1985'
 
         Returns:
-            The PDF bytes, or None when CCIS has no matching record. None is
-            an ordinary answer, not a failure: plenty of people have no record.
+            A CcisResult. With a record it holds the case summary PDF. With no
+            matching record it holds the printed no-results page, taken while
+            the banner is up and the search criteria are still in the form, so
+            the PDF shows who was searched. No record is an ordinary answer,
+            not a failure: plenty of people have none.
 
         Raises:
             RowProblem: The search ran but CCIS did not behave as expected for
@@ -264,12 +284,14 @@ class CcisSession:
             self._search(first_name, last_name, dob)
 
             if self._no_results():
-                return None
+                # Printed before the finally resets the form, so the criteria
+                # and the banner are both on the page.
+                return CcisResult(self._print_to_pdf(), has_record=False)
 
             self._open_case_summary()
             pdf_bytes = self._print_to_pdf()
             self._back_to_search()
-            return pdf_bytes
+            return CcisResult(pdf_bytes, has_record=True)
 
         except (RowProblem, SystemProblem):
             raise

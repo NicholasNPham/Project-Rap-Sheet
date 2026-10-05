@@ -70,6 +70,13 @@ class Outcome:
     FILED = "Filed in STAC"
     REACHED_SAVE = "Reached save - not pressed"
     REHEARSED = "Rehearsed - nothing uploaded"
+    # The no-results page is filed like a rap sheet, so these mirror the three
+    # above and say which kind of PDF went in.
+    FILED_NO_RECORD = "Filed in STAC - no CCIS record"
+    REACHED_SAVE_NO_RECORD = "Reached save - not pressed (no CCIS record)"
+    REHEARSED_NO_RECORD = "Rehearsed - nothing uploaded (no CCIS record)"
+    # No longer written: a no-record row is filed now, compound surname or not.
+    # Kept so sheets from earlier runs still read as finished.
     NO_CCIS_RECORD = "No matches found in CCIS"
     COMPOUND_NAME = "Warning - compound last name, check manually"
     NO_UCN = "No case number in this row"
@@ -87,6 +94,9 @@ Outcome.TERMINAL = frozenset({
     Outcome.FILED,
     Outcome.REACHED_SAVE,
     Outcome.REHEARSED,
+    Outcome.FILED_NO_RECORD,
+    Outcome.REACHED_SAVE_NO_RECORD,
+    Outcome.REHEARSED_NO_RECORD,
     Outcome.NO_CCIS_RECORD,
     Outcome.COMPOUND_NAME,
     Outcome.NO_UCN,

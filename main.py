@@ -80,17 +80,32 @@ def _safe_piece(value: str) -> str:
     return cleaned or "unknown"
 
 
-def pdf_path_for(folder: Path, row: dict) -> Path:
+NO_RECORD_FILENAME_TAG = "NO_RECORD"
+
+
+def pdf_path_for(folder: Path, row: dict, has_record: bool = True) -> Path:
     """Where this row's PDF goes.
 
     Named the way venire names them, person id first, so the folder sorts in
-    spreadsheet order and a file can be matched back to a row by eye.
+    spreadsheet order and a file can be matched back to a row by eye. A
+    no-results PDF carries a NO_RECORD tag so the two kinds are told apart in
+    the folder without opening them.
+
+    Args:
+        folder: This run's PDF folder.
+        row: One dict from Spreadsheet.load_rows.
+        has_record: False when the PDF is the CCIS no-results page.
+
+    Returns:
+        The path to write the PDF to.
     """
     pieces = [
         _safe_piece(row["person_id"]),
         _safe_piece(row["last_name"]),
         _safe_piece(row["first_name"]),
     ]
+    if not has_record:
+        pieces.append(NO_RECORD_FILENAME_TAG)
     return folder / f"{'_'.join(pieces)}.pdf"
 
 
@@ -120,8 +135,8 @@ def process_row(row: dict, ccis: CcisSession, runner: StacRunner, pdf_folder: Pa
         SystemProblem: CCIS or STAC is broken, rather than this row being odd.
             The caller counts these and stops the run when they pile up.
     """
-    # CCIS first. If there is no record there is nothing to file, and the row
-    # is finished without STAC being touched at all.
+    # CCIS first. Every search yields a PDF, either the case summary or the
+    # printed no-results page, and either one goes on to STAC.
     if row["search_last"] != row["last_name"]:
         logger.info(
             "%s: searching CCIS for surname %r, with the suffix from %r dropped",
@@ -129,34 +144,31 @@ def process_row(row: dict, ccis: CcisSession, runner: StacRunner, pdf_folder: Pa
         )
 
     try:
-        pdf_bytes = ccis.fetch_pdf(row["first_name"], row["search_last"], row["dob"])
+        result = ccis.fetch_pdf(row["first_name"], row["search_last"], row["dob"])
     except RowProblem as error:
         logger.warning("%s: CCIS problem, %s", _describe(row), error)
         return Outcome.ERROR
 
-    if pdf_bytes is None:
-        # venire's insight, kept: a compound last name that returns nothing is
-        # not the same as a genuine no-record. CCIS may have the person indexed
-        # under only part of their surname, so this goes to a person rather
-        # than being recorded as clean.
-        if len(row["search_last"].split()) >= 2:
-            logger.warning(
-                "%s: no CCIS record, but %r is a compound last name and may be "
-                "indexed under part of it. Flagged for manual review.",
-                _describe(row), row["search_last"],
-            )
-            return Outcome.COMPOUND_NAME
-
-        logger.info("%s: no CCIS record, nothing to file", _describe(row))
-        return Outcome.NO_CCIS_RECORD
+    has_record = result.has_record
+    if not has_record and len(row["search_last"].split()) >= 2:
+        # venire's insight, kept as a warning: a compound last name that
+        # returns nothing may be indexed under only part of the surname. The
+        # no-results PDF is filed regardless; this is for whoever reviews the log.
+        logger.warning(
+            "%s: no CCIS record, but %r is a compound last name and may be "
+            "indexed under part of it. Filing the no-results PDF anyway.",
+            _describe(row), row["search_last"],
+        )
 
     # Selenium uploads from a path, so the bytes have to land on disk.
     pdf_folder.mkdir(parents=True, exist_ok=True)
-    pdf_file = pdf_path_for(pdf_folder, row)
-    pdf_file.write_bytes(pdf_bytes)
+    pdf_file = pdf_path_for(pdf_folder, row, has_record)
+    pdf_file.write_bytes(result.pdf_bytes)
     logger.info(
-        "%s: CCIS record captured, %s KB -> %s",
-        _describe(row), len(pdf_bytes) // 1024, pdf_file.name,
+        "%s: %s captured, %s KB -> %s",
+        _describe(row),
+        "CCIS record" if has_record else "no-results page",
+        len(result.pdf_bytes) // 1024, pdf_file.name,
     )
 
     # Then STAC. The PDF stays on disk either way: it is the audit trail, and
@@ -173,10 +185,10 @@ def process_row(row: dict, ccis: CcisSession, runner: StacRunner, pdf_folder: Pa
 
     session = runner.session
     if session.save_enabled:
-        return Outcome.FILED
+        return Outcome.FILED if has_record else Outcome.FILED_NO_RECORD
     if session.upload_enabled:
-        return Outcome.REACHED_SAVE
-    return Outcome.REHEARSED
+        return Outcome.REACHED_SAVE if has_record else Outcome.REACHED_SAVE_NO_RECORD
+    return Outcome.REHEARSED if has_record else Outcome.REHEARSED_NO_RECORD
 
 
 def check(config: dict) -> int:
