@@ -1,0 +1,5 @@
+selenium>=4.6
+webdriver-manager
+openpyxl==3.1.5
+PyYAML
+keyring

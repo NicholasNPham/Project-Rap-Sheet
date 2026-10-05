@@ -1,0 +1,51 @@
+# ---------------------------------------------------------------- secrets
+# Credentials for CCIS and STAC. Both spellings, because the project can be
+# laid out with a config/ folder or flat in the root.
+config.yaml
+config/config.yaml
+key.py
+
+# ------------------------------------------------------------ case material
+# Rap sheet spreadsheets carry defendant names, dates of birth and case
+# numbers. None of that belongs in a repository, private or not.
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+!*.template.xlsx
+
+# Captured case summaries. These ARE criminal histories.
+pdfs/
+screenshots/
+results/
+temp/
+
+# ------------------------------------------------------------------- output
+logs/
+*.log
+# Left behind only if an atomic spreadsheet save is interrupted.
+.*.xlsx.saving
+
+# -------------------------------------------------------------------- python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ----------------------------------------------------------------- editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# ------------------------------------------------------------------- os junk
+.DS_Store
+Thumbs.db
+desktop.ini

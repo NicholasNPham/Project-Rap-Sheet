@@ -1,0 +1,154 @@
+# Copy to config.yaml and fill in. config.yaml is gitignored, never commit it.
+
+# CCIS, where the case summaries come from. Same site venire_3.0 uses.
+ccis:
+  url: "https://ccis.example.com"
+
+  # true runs CCIS's Chrome with no visible window. The window size is fixed
+  # at 1920x1080 in that mode because the PDF is rendered from the page, so a
+  # narrower viewport changes what the captured summary looks like.
+  headless: false
+
+  # Seconds. Carried over from venire's config.json, where they are proven.
+  wait_timeout: 5
+  # Short on purpose: this is how long to wait for the "No matches found."
+  # banner, and most rows that have a record never show it. A long value here
+  # would add itself to every successful row.
+  no_results_wait_timeout: 1
+  pause_between_actions: 1
+
+  # Element locators. Every one of these has a working default taken from
+  # venire's config.json, so this whole block can be left out. Override one
+  # only when a CCIS release renames a field, which is then a config edit
+  # rather than a code change.
+  #
+  # locators:
+  #   last_name_field: "search_tab:personForm:lastname"
+  #   search_button: "//button[.//span[text()='Search']]"
+
+# STAC, where the PDFs are filed. Point this at TEST STAC until a live run is
+# deliberately approved.
+stac:
+  url: "https://stac-test.example.com"
+
+  # The one Type/Subtype every rap sheet in the run is filed under.
+  #
+  # REQUIRED, and there is deliberately no default. Read the pair off STAC's
+  # Type/Subtype dialog exactly as its "Image Type" and "Image Sub Type"
+  # columns spell it, spaces included. PCSO911 hardcodes DISCOVERY/911AUDIO
+  # for its audio; whatever the equivalent is for a criminal history goes here.
+  #
+  # Getting this wrong does not misfile one document, it misfiles the entire
+  # run, which is why the tool refuses to start rather than guessing.
+  document_type: "FILL-THIS-IN"
+  subtype: "FILL-THIS-IN"
+
+  # A second gate, the same idea as DALYN's. The tool checks the url looks
+  # like a test instance and refuses to start if this says true but the url
+  # does not. Set it to false only when a live run is intended.
+  is_test_instance: true
+
+  # Two switches, three stages. Work down the list.
+  #
+  #   upload_enabled: false, save_enabled: false
+  #       Signs in, finds every case, checks every name against the sheet,
+  #       picks the Type/Subtype, then stops. Nothing is sent to STAC at all.
+  #       Start here, on the real spreadsheet. A clean pass proves the case
+  #       numbers and names in the sheet are right, which is the part worth
+  #       knowing before anything is filed.
+  #
+  #   upload_enabled: true, save_enabled: false
+  #       Also uploads the PDF and proves the Save button is there and ready,
+  #       then refuses to press it. The files DO reach STAC's server, so only
+  #       do this against test STAC.
+  #
+  #   upload_enabled: true, save_enabled: true
+  #       Presses Save. Rap sheets go onto cases.
+  #
+  # save_enabled without upload_enabled is refused: there would be nothing
+  # to save.
+  upload_enabled: false
+  save_enabled: false
+
+  # Compares STAC's defendant name against the name in the spreadsheet row.
+  # This is the only thing checking that a row's case number and its name
+  # belong together, and a mismatch means a person's criminal history would go
+  # onto someone else's case. Leave it on. Turning it off logs a warning on
+  # every single row.
+  check_name: true
+
+  # Attempts per row. A wedged Kendo dialog does not recover from another
+  # click, so a retry closes Chrome and signs in again. Never applies once
+  # Save has been pressed: that row goes to a person instead, because a retry
+  # could file the same rap sheet twice. 1 disables retrying.
+  max_attempts: 2
+
+  # Seconds. Uploads are slow and the Kendo dialogs need a beat.
+  wait_timeout: 10
+  upload_timeout: 60
+
+  # true closes Chrome and signs in again after every row, the way PCSO911
+  # and DALYN do. That is roughly ten seconds a row, and at one upload box
+  # per row it is the largest single cost in a run, which is why it defaults
+  # to false here and does not in DALYN. The browser is still thrown away
+  # after any failure either way, which is where the leftover state that this
+  # guards against actually comes from.
+  fresh_browser: false
+
+  # Seconds to pause after each step, so a person can watch what the browser
+  # is doing. 0 for normal running. Useful for the first rehearsal pass.
+  action_pause: 0
+
+  # Labels to look for in STAC's search-criteria dropdown. The UCN one is
+  # known, because PCSO911 and DALYN both use it.
+  #
+  # STAC's wording for the case number is NOT known, so several spellings are
+  # tried and the first the dropdown offers wins. If none match, the run logs
+  # the labels the dropdown really lists and carries on with UCN only — read
+  # the right one off that log line and set it here. Either a single label or
+  # a list works.
+  #
+  # ucn_criteria: "UCN"
+  # case_number_criteria: ["Case Number", "Case No", "Case #"]
+
+# The spreadsheet the cases arrive in. One row per defendant.
+#
+# The defaults below match the real file:
+#   A Case Number | B UCN | C Defendant Name | D DOB
+# with the outcome written to E, the first free column, and row 1 a header.
+# If that is your layout, this whole block is just `file:`.
+#
+# Column numbers, where A is 1.
+excel:
+  file: "Path/to/Example_Cases.xlsx"
+  sheet: "Sheet1"
+
+  ucn_column: 2            # tried first. Unique statewide
+  name_column: 3           # "Last, First Middle"
+  dob_column: 4
+  outcome_column: 5        # written by this tool. Must be a free column
+
+  # Optional, 0 means the sheet does not have it.
+  #
+  # The case number is the fallback identifier: if the UCN finds no case in
+  # STAC, the same case is looked up by this instead. The two fail
+  # independently, so a mistyped UCN still files correctly. Set to 0 to search
+  # by UCN only.
+  case_number_column: 1
+  # The real sheet has no ID column, so the row number names the PDF instead.
+  id_column: 0
+
+  # 2 when row 1 is a header, which it is in the real file.
+  first_data_row: 2
+
+# Paths, relative to the project root unless absolute.
+paths:
+  logs: "logs"
+  # Captured case summaries, in a dated folder per run. Kept after filing:
+  # they are the audit trail, and what somebody would file by hand for a row
+  # that needs it.
+  pdfs: "pdfs"
+  results: "results"
+  # chromedriver.exe, used for both browsers. Leave blank to let Selenium
+  # find one, or webdriver_manager fetch one.
+  chromedriver: ""
