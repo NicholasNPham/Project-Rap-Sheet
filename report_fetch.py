@@ -64,7 +64,10 @@ DEFAULT_DOWNLOAD_TIMEOUT = 60
 # appears in that time the click most likely landed before the report was
 # ready, and it is tried once more.
 DOWNLOAD_START_SECONDS = 20
-EXPORT_CLICK_ATTEMPTS = 2
+EXPORT_CLICK_ATTEMPTS = 3
+
+# Seconds to keep retrying the rename while Chrome still holds the file.
+RENAME_SECONDS = 10
 
 # How often to look at the folder while waiting.
 POLL_SECONDS = 0.5
@@ -123,34 +126,36 @@ def fetch_report(
         driver.switch_to.default_content()
         logger.info("Clicked Excel export (try %s of %s)", attempt, EXPORT_CLICK_ATTEMPTS)
 
-        if _wait_for_start(download_dir, before, DOWNLOAD_START_SECONDS):
-            downloaded = _wait_for_finish(download_dir, before, download_timeout)
+        if not _wait_for_start(download_dir, before, DOWNLOAD_START_SECONDS):
+            logger.warning(
+                "No download started within %ss of clicking export", DOWNLOAD_START_SECONDS
+            )
+            continue
+
+        arrived = _wait_for_finish(download_dir, before, download_timeout)
+        if REPORT_NAME.lower() in arrived.name.lower():
+            downloaded = arrived
             break
+
+        # Chrome names an HTML response with no filename downloads.htm. That
+        # is STAC answering the export with a page, not the report. It is left
+        # in the folder, ignored from here on, and the export clicked again.
         logger.warning(
-            "No download started within %ss of clicking export", DOWNLOAD_START_SECONDS
+            "The export came back as %r, not %s. Clicking export again.",
+            arrived.name, REPORT_NAME,
         )
+        before.add(arrived.name)
 
     if downloaded is None:
         raise SystemProblem(
-            f"Clicked the Excel export {EXPORT_CLICK_ATTEMPTS} times and no file "
-            f"arrived in {download_dir}."
-        )
-
-    if REPORT_NAME.lower() not in downloaded.name.lower():
-        # Still used: the reader checks the header, which is the real test.
-        # Said here because a different report would explain a header error.
-        logger.warning(
-            "The export is called %r, not %s. Check the report form's default.",
-            downloaded.name, REPORT_NAME,
+            f"Clicked the Excel export {EXPORT_CLICK_ATTEMPTS} times and no "
+            f"{REPORT_NAME} file arrived in {download_dir}."
         )
 
     final = download_dir / (
         f"{REPORT_NAME}_{datetime.now():%Y-%m-%d_%H%M%S}{downloaded.suffix.lower()}"
     )
-    try:
-        downloaded.replace(final)
-    except OSError as error:
-        raise SystemProblem(f"Could not rename the export {downloaded.name}: {error}") from error
+    _rename(downloaded, final)
 
     logger.info("Report saved as %s", final.name)
     return final
@@ -318,6 +323,31 @@ def _wait_for_start(folder: Path, before: set[str], seconds: float) -> bool:
             return True
         time.sleep(POLL_SECONDS)
     return False
+
+
+def _rename(source: Path, target: Path) -> None:
+    """Rename the export, retrying while Chrome still has it open.
+
+    A steady size is not proof Chrome has let go of the file, and Windows
+    refuses to rename a file another process holds.
+
+    Raises:
+        SystemProblem: Still locked after RENAME_SECONDS, or any other OS error.
+    """
+    deadline = time.monotonic() + RENAME_SECONDS
+    while True:
+        try:
+            source.replace(target)
+            return
+        except PermissionError as error:
+            if time.monotonic() >= deadline:
+                raise SystemProblem(
+                    f"Could not rename the export {source.name}; it was still in use "
+                    f"after {RENAME_SECONDS}s: {error}"
+                ) from error
+            time.sleep(POLL_SECONDS)
+        except OSError as error:
+            raise SystemProblem(f"Could not rename the export {source.name}: {error}") from error
 
 
 def _wait_for_finish(folder: Path, before: set[str], seconds: float) -> Path:
