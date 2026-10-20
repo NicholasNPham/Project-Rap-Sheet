@@ -40,6 +40,18 @@ REPORT_MENU_CSS = "li[data-button-id='report']"
 REPORT_SEARCH_BUTTON_ID = "pagesIncidentReportsIndexFrm_report_button"
 EXCEL_EXPORT_CSS = "button.report-export-btn[data-format='Excel']"
 
+# The dialog STAC shows when Search is pressed before the form has filled in
+# its default report. Matched on its text, and Ok as the next button after
+# it, so nothing depends on the dialog's own markup.
+NOT_READY_TEXT_XPATH = "//*[normalize-space(text())='Please select a report.']"
+NOT_READY_OK_XPATH = f"{NOT_READY_TEXT_XPATH}/following::button[normalize-space(.)='Ok'][1]"
+
+# Seconds to watch for that dialog after pressing Search, and to wait before
+# pressing it again. Search is tried this many times in all.
+NOT_READY_WATCH_SECONDS = 3
+SEARCH_RETRY_PAUSE_SECONDS = 2
+SEARCH_ATTEMPTS = 3
+
 # Anything Kendo or the report viewer shows while it is still working. The
 # export is only clicked once none of these is visible.
 LOADING_CSS = ".k-loading-mask, .k-loading-image, .k-loader, .k-i-loading"
@@ -98,7 +110,7 @@ def fetch_report(
 
     _click(wait, driver, (By.CSS_SELECTOR, CASES_SIDEBAR_CSS), "the Cases sidebar")
     _click(wait, driver, (By.CSS_SELECTOR, REPORT_MENU_CSS), "Report in the case menu")
-    _click(wait, driver, (By.ID, REPORT_SEARCH_BUTTON_ID), "the report's Search button")
+    _start_search(wait, driver)
     logger.info("Report search started, waiting for it to load")
 
     before = _files_in(download_dir)
@@ -176,6 +188,67 @@ def _click(wait: WebDriverWait, driver, locator: tuple, what: str) -> None:
         driver.execute_script("arguments[0].click();", element)
     except TimeoutException as error:
         raise SystemProblem(f"Could not click {what}; it never became clickable.") from error
+
+
+def _start_search(wait: WebDriverWait, driver) -> None:
+    """Press the report's Search, again if STAC says no report is selected yet.
+
+    The Search button is clickable before the form has loaded its default
+    report. Pressed that early, STAC shows "Please select a report." and runs
+    nothing, which used to look like a report that never finished loading.
+
+    Raises:
+        SystemProblem: Search could not be clicked, the dialog could not be
+            dismissed, or the form still had no report after every attempt.
+    """
+    for attempt in range(1, SEARCH_ATTEMPTS + 1):
+        _click(wait, driver, (By.ID, REPORT_SEARCH_BUTTON_ID), "the report's Search button")
+        if not _dismiss_not_ready(driver):
+            return
+        logger.warning(
+            "Search was pressed before the report form had loaded (try %s of %s)",
+            attempt, SEARCH_ATTEMPTS,
+        )
+        time.sleep(SEARCH_RETRY_PAUSE_SECONDS)
+
+    raise SystemProblem(
+        f"Pressed the report's Search {SEARCH_ATTEMPTS} times and STAC said "
+        "'Please select a report.' every time. The form is not filling in its "
+        "default report."
+    )
+
+
+def _dismiss_not_ready(driver) -> bool:
+    """Close the "Please select a report." dialog if it appears.
+
+    Returns:
+        True if the dialog appeared and was closed, False if it never showed.
+
+    Raises:
+        SystemProblem: The dialog appeared but its Ok button could not be
+            clicked, which would leave it blocking every later click.
+    """
+    try:
+        WebDriverWait(driver, NOT_READY_WATCH_SECONDS).until(
+            EC.visibility_of_element_located((By.XPATH, NOT_READY_TEXT_XPATH))
+        )
+    except TimeoutException:
+        return False
+
+    try:
+        ok = WebDriverWait(driver, NOT_READY_WATCH_SECONDS).until(
+            EC.element_to_be_clickable((By.XPATH, NOT_READY_OK_XPATH))
+        )
+        driver.execute_script("arguments[0].click();", ok)
+        WebDriverWait(driver, NOT_READY_WATCH_SECONDS).until(
+            EC.invisibility_of_element_located((By.XPATH, NOT_READY_TEXT_XPATH))
+        )
+    except TimeoutException as error:
+        raise SystemProblem(
+            "STAC said 'Please select a report.' and its Ok button could not be "
+            "clicked to close it."
+        ) from error
+    return True
 
 
 def _find_export(driver) -> WebElement | None:
