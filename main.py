@@ -19,7 +19,8 @@ A filed case drops off the report, so a rerun after a crash fetches the report
 again and finds only what is left. Each export gets a .xlsx working copy that
 holds the outcome of every row, so the end of a run says exactly which cases
 need a person. --report reruns on an export already downloaded; outcomes in
-its working copy are kept, so nothing filed is filed twice.
+its working copy are kept, so nothing filed is filed twice. --watch keeps
+running, with a fresh pass every 30 minutes through the working day.
 
 Nothing reaches STAC until config says so. stac.upload_enabled and
 stac.save_enabled are both false by default: a first run finds every case,
@@ -29,8 +30,10 @@ checks every name and picks the Type/Subtype without sending a single file.
 import argparse
 import re
 import sys
+import time
 from collections import Counter
-from datetime import date
+from datetime import date, datetime, timedelta
+from datetime import time as clock
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -59,6 +62,21 @@ logger = get_logger("main")
 EXIT_OK = 0
 EXIT_SYSTEM_PROBLEM = 1
 EXIT_CONFIG_PROBLEM = 2
+# A pass pressed Save on some row and STAC never confirmed it. A person has to
+# look before anything runs again, so --watch stops on this.
+EXIT_CHECK_BY_HAND = 3
+
+# --watch runs a pass every WATCH_EVERY_MINUTES from WATCH_START to WATCH_END
+# inclusive, on these weekdays (Monday is 0). A pass that runs past the next
+# slot makes it skip that slot rather than start a second pass late.
+WATCH_WEEKDAYS = frozenset(range(5))
+WATCH_START = clock(7, 30)
+WATCH_END = clock(18, 0)
+WATCH_EVERY_MINUTES = 30
+
+# How often --watch looks at the clock while waiting. Short sleeps rather than
+# one long one, so a PC that wakes from sleep catches up on its own.
+WATCH_POLL_SECONDS = 30
 
 # How many rows in a row may fail with a SystemProblem before the run gives up.
 # One case with a page that will not settle should not end a run; STAC or CCIS
@@ -469,7 +487,76 @@ def run(config: dict, limit: int | None, only_row: int | None, report: Path | No
 
         _summarise(todo, working_copy)
 
+    if any(row["outcome"] == Outcome.CHECK_BY_HAND for row in todo):
+        return EXIT_CHECK_BY_HAND
     return EXIT_OK
+
+
+def next_slot(now: datetime) -> datetime:
+    """The first --watch slot at or after `now`.
+
+    Args:
+        now: The current time.
+
+    Returns:
+        A weekday time between WATCH_START and WATCH_END on the
+        WATCH_EVERY_MINUTES grid. A slot whose minute has already begun is
+        past, so a pass that finishes quickly does not run twice.
+    """
+    day = now.date()
+    while True:
+        if day.weekday() in WATCH_WEEKDAYS:
+            slot = datetime.combine(day, WATCH_START)
+            last = datetime.combine(day, WATCH_END)
+            while slot <= last:
+                if slot >= now:
+                    return slot
+                slot += timedelta(minutes=WATCH_EVERY_MINUTES)
+        day += timedelta(days=1)
+
+
+def _sleep_until(moment: datetime) -> None:
+    """Poll the clock until `moment` has passed."""
+    while (remaining := (moment - datetime.now()).total_seconds()) > 0:
+        time.sleep(min(remaining, WATCH_POLL_SECONDS))
+
+
+def watch(config: dict, limit: int | None) -> int:
+    """Run a fresh pass at every slot until stopped.
+
+    Each pass fetches the report again. Filed cases drop off it, so a pass
+    only sees what earlier passes have not done.
+
+    A SystemProblem ends that pass only: STAC being down at 9:00 should not
+    cost the 9:30 pass. Anything else ends the watch, through main's handlers:
+    a ConfigProblem will not fix itself, and a bug would repeat every slot.
+
+    Args:
+        config: From load_config. Read once, so a config change needs a restart.
+        limit: Passed to every pass, as with --limit.
+
+    Returns:
+        EXIT_CHECK_BY_HAND if a pass left a save unconfirmed. The next pass
+        could file that rap sheet again, so the watch stops for a person.
+    """
+    while True:
+        slot = next_slot(datetime.now())
+        logger.info("Watching. Next pass at %s. Ctrl+C to stop.", f"{slot:%a %Y-%m-%d %H:%M}")
+        _sleep_until(slot)
+
+        logger.info("=== Pass for the %s slot ===", f"{slot:%H:%M}")
+        try:
+            code = run(config, limit, None, None)
+        except SystemProblem as error:
+            logger.error("Pass stopped: %s. Trying again at the next slot.", error)
+            continue
+
+        if code == EXIT_CHECK_BY_HAND:
+            logger.error(
+                "Stopping the watch: a save was never confirmed. Check those cases "
+                "by hand, then start it again."
+            )
+            return code
 
 
 def _summarise(rows: list, working_copy: Path) -> None:
@@ -513,7 +600,7 @@ def main(argv: list[str] | None = None) -> int:
             sys.argv.
 
     Returns:
-        EXIT_OK, EXIT_SYSTEM_PROBLEM or EXIT_CONFIG_PROBLEM.
+        EXIT_OK, EXIT_SYSTEM_PROBLEM, EXIT_CONFIG_PROBLEM or EXIT_CHECK_BY_HAND.
     """
     parser = argparse.ArgumentParser(
         description="File CCIS case summaries onto the cases in STAC's AutoCCIS report."
@@ -547,7 +634,17 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="Path to a config file other than config/config.yaml.",
     )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Keep running: a fresh pass every 30 minutes, 7:30 to 18:00, "
+             "Monday to Friday. Ctrl+C to stop.",
+    )
     args = parser.parse_args(argv)
+
+    if args.watch and (args.report or args.only_row is not None or args.check):
+        parser.error("--watch fetches a fresh report each pass, so it cannot take "
+                     "--report, --only-row or --check")
 
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
@@ -575,6 +672,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.check:
             return check(config, report)
+        if args.watch:
+            return watch(config, args.limit)
         return run(config, args.limit, args.only_row, report)
     except ConfigProblem as error:
         logger.error("Config problem: %s", error)
