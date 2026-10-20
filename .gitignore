@@ -13,6 +13,14 @@ key.py
 *.xls
 *.csv
 !*.template.xlsx
+# The report also exports as PDF and Word (really RTF). Same data.
+*.pdf
+*.doc
+*.docx
+*.rtf
+
+# STAC report exports and their working copies. Names, DOBs, UCNs.
+reports/
 
 # Captured case summaries. These ARE criminal histories.
 pdfs/

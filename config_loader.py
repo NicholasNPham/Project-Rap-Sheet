@@ -27,8 +27,11 @@ import keyring
 import yaml
 
 from exceptions import ConfigProblem
+from logger import get_logger
 
 from keyring.errors import KeyringError
+
+logger = get_logger(__name__)
 
 _HERE = Path(__file__).resolve().parent
 
@@ -62,7 +65,7 @@ PLACEHOLDERS = frozenset({
     "",
     "https://stac-test.example.com",
     "https://ccis.example.com",
-    "Path/to/RAPSHEET.xlsx",
+    "https://stac.example.com",
     "FILL-THIS-IN",
 })
 
@@ -89,27 +92,23 @@ DEFAULTS = {
         "pause_between_actions": 1,
         "headless": False,
     },
-    # Defaults match the sheet these cases actually arrive in:
-    #   A Case Number | B UCN | C Defendant Name | D DOB
-    # with the outcome written to E, the first free column, and row 1 a header.
-    # There is no id column, so id_column is 0.
-    "excel": {
-        "sheet": "Sheet1",
-        "case_number_column": 1,
-        "ucn_column": 2,
-        "name_column": 3,
-        "dob_column": 4,
-        "outcome_column": 5,
-        "id_column": 0,
-        "first_data_row": 2,
+    # Seconds. The report takes a while to build through its loading phases;
+    # the download itself is small.
+    "report": {
+        "report_timeout": 180,
+        "download_timeout": 60,
     },
     "paths": {
         "logs": "logs",
         "pdfs": "pdfs",
         "results": "results",
+        "reports": "reports",
         "chromedriver": "",
     },
 }
+
+# Path settings resolved against the project root when relative.
+PATH_KEYS = ("logs", "pdfs", "results", "reports")
 
 
 def _merge(base: dict, over: dict) -> dict:
@@ -167,7 +166,7 @@ def load_config(path: Path | None = None) -> dict:
     _validate_credentials(config)
     _validate_switches(config)
     _validate_type_subtype(config)
-    _validate_excel(config)
+    _validate_report(config)
     _resolve_paths(config)
 
     return config
@@ -316,79 +315,45 @@ def _validate_switches(config: dict) -> None:
         raise ConfigProblem(f"A stac timeout value is not a number: {error}") from error
 
 
-def _validate_excel(config: dict) -> None:
-    """The spreadsheet must exist and its columns must be distinct.
+def _validate_report(config: dict) -> None:
+    """The report needs a STAC url and positive timeouts. The old excel block is ignored.
 
-    Two settings pointing at the same column is the quiet version of this
-    going wrong: a ucn_column left at its default while the UCN really sits
-    in the outcome column would read the previous run's outcome text as a
-    case number.
+    report.url is the STAC the report is run on, which is prod: that is where
+    the real list of cases lives. Nothing is ever uploaded there. Filing goes
+    to stac.url, which can be test. The two may also be the same instance.
+    Both are signed in to with the rap-sheet-stac login.
+
+    The cases come from STAC's report now, so there is no spreadsheet to
+    configure. A config.yaml from before the change still has an excel:
+    block; it is ignored rather than refused, so an old config keeps working,
+    and said once so nobody edits it expecting an effect.
+
+    Raises:
+        ConfigProblem: report.url is missing, or a timeout is not a number
+            or is not above zero.
     """
-    excel = config["excel"]
+    if "excel" in config:
+        logger.warning(
+            "config.yaml still has an excel: section. It is ignored: the cases "
+            "come from STAC's report now. Delete it to silence this."
+        )
+        del config["excel"]
 
-    workbook = str(excel.get("file") or "").strip()
-    if workbook in PLACEHOLDERS:
-        raise ConfigProblem("excel.file is not set in config.yaml.")
-
-    workbook_path = Path(workbook)
-    if not workbook_path.is_absolute():
-        workbook_path = PROJECT_ROOT / workbook_path
-    if not workbook_path.is_file():
-        raise ConfigProblem(f"excel.file points at {workbook_path}, which is not a file.")
-    excel["file"] = workbook_path
-
-    # id_column and case_number_column may be 0, meaning the sheet has no such
-    # column. The other three are what the run cannot work without: a name and
-    # a date of birth to search CCIS with, and somewhere to record the outcome.
-    REQUIRED = ("ucn_column", "dob_column", "name_column", "outcome_column")
-    OPTIONAL = ("id_column", "case_number_column")
-
-    columns = {}
-    for key in REQUIRED + OPTIONAL:
+    report = config["report"]
+    report["url"] = _require(report, "url", "report").rstrip("/")
+    for key in ("report_timeout", "download_timeout"):
         try:
-            number = int(excel.get(key) or 0)
+            report[key] = int(report.get(key))
         except (TypeError, ValueError) as error:
-            raise ConfigProblem(f"excel.{key} is not a number.") from error
-
-        if number < 0:
-            raise ConfigProblem(f"excel.{key} cannot be negative.")
-        if number == 0:
-            if key in REQUIRED:
-                raise ConfigProblem(
-                    f"excel.{key} must be 1 or greater (column A is 1)."
-                )
-            # Absent, which is allowed. Not entered into the clash check,
-            # since several absent columns are not a collision.
-            excel[key] = 0
-            continue
-
-        excel[key] = number
-        columns.setdefault(number, []).append(key)
-
-    clashes = {
-        number: keys for number, keys in columns.items() if len(keys) > 1
-    }
-    if clashes:
-        described = "; ".join(
-            f"column {number} is set for {' and '.join(keys)}"
-            for number, keys in clashes.items()
-        )
-        raise ConfigProblem(
-            f"Two excel settings point at the same column: {described}. "
-            "Each one the sheet has needs its own column. Set id_column or "
-            "case_number_column to 0 if the sheet does not have that column."
-        )
-
-    try:
-        excel["first_data_row"] = max(1, int(excel.get("first_data_row", 1)))
-    except (TypeError, ValueError) as error:
-        raise ConfigProblem("excel.first_data_row is not a number.") from error
+            raise ConfigProblem(f"report.{key} is not a whole number of seconds.") from error
+        if report[key] <= 0:
+            raise ConfigProblem(f"report.{key} must be above zero.")
 
 
 def _resolve_paths(config: dict) -> None:
     """Turn the path settings into absolute Paths under the project root."""
     paths = config["paths"]
-    for key in ("logs", "pdfs", "results"):
+    for key in PATH_KEYS:
         value = Path(str(paths.get(key) or key))
         paths[key] = value if value.is_absolute() else PROJECT_ROOT / value
 

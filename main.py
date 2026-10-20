@@ -1,20 +1,25 @@
 """RAP SHEET entry point.
 
-One pass down the spreadsheet. For each row: search CCIS by name and date of
-birth, capture the case summary as a PDF, then file that PDF on the row's case
-number in STAC under one Type/Subtype.
+One pass over the STAC AutoCCIS report. Sign in to the report's STAC
+(report.url, prod), run the report, download it as Excel, and close that
+browser. Then, signed in to the filing STAC (stac.url, which can be test),
+for each case on the report: search CCIS by name and date of birth, capture
+the case summary (or the printed no-results page) as a PDF, open the case
+from the report's link in a new tab, and file the PDF under one Type/Subtype.
+The links name the report's STAC; test holds the same incident ids, so they
+are pointed at the filing STAC before use.
 
-Two sessions, both opened once and held for the whole run: CCIS in one Chrome,
-STAC in another. They are driven one after the other, not at the same time.
-Overlapping them would save the four seconds CCIS takes while STAC is being
-prepared, and would cost a speculative upload box opened on every row that
-turns out to have no CCIS record at all. PROJECT-DALYN already has a function
-for cleaning up exactly that mess, and its comment says why: an unsaved upload
-bleeds into the next document.
+Two sessions for the filing, both opened once and held for the whole run:
+STAC in one Chrome, CCIS in another. They are driven one after the other, not at the same
+time. Overlapping them would save the few seconds CCIS takes while STAC is
+being prepared, and would cost a speculative upload box opened on every row
+that turns out to need a person.
 
-The outcome column is the record of what happened and the resume marker. A row
-with anything in that cell is left alone, so a run that stops halfway picks up
-where it left off and never files the same rap sheet twice.
+A filed case drops off the report, so a rerun after a crash fetches the report
+again and finds only what is left. Each export gets a .xlsx working copy that
+holds the outcome of every row, so the end of a run says exactly which cases
+need a person. --report reruns on an export already downloaded; outcomes in
+its working copy are kept, so nothing filed is filed twice.
 
 Nothing reaches STAC until config says so. stac.upload_enabled and
 stac.save_enabled are both false by default: a first run finds every case,
@@ -40,12 +45,14 @@ for _candidate in (PROJECT_ROOT / "src", PROJECT_ROOT):
 # src/ modules import each other flat (from exceptions import ...), so the
 # path insert above has to run before any of these.
 import excel_handler  # noqa: E402
+import report_reader  # noqa: E402
 from ccis import CcisSession  # noqa: E402
 from config_loader import load_config  # noqa: E402
 from exceptions import ConfigProblem, RowProblem, SystemProblem  # noqa: E402
 from excel_handler import Outcome, Spreadsheet  # noqa: E402
 from logger import get_logger, setup_logging  # noqa: E402
-from stac import SaveMayHaveHappened, StacRunner  # noqa: E402
+from report_fetch import fetch_report  # noqa: E402
+from stac import SaveMayHaveHappened, StacRunner, StacSession  # noqa: E402
 
 logger = get_logger("main")
 
@@ -58,10 +65,13 @@ EXIT_CONFIG_PROBLEM = 2
 # being down should. Reset by any row that gets through.
 MAX_CONSECUTIVE_FAILURES = 5
 
+# How many rows --check lists so the column mapping can be eyeballed.
+CHECK_SAMPLE_ROWS = 5
+
 # Characters that cannot go in a filename on Windows, plus the ones that make
-# a path ambiguous anywhere. Names in this spreadsheet carry apostrophes,
-# full stops and the occasional slash (O'BRIEN, JR., SMITH/JONES), and venire
-# writes them into a path unexamined.
+# a path ambiguous anywhere. Names carry apostrophes, full stops and the
+# occasional slash (O'BRIEN, JR., SMITH/JONES), and venire writes them into a
+# path unexamined.
 UNSAFE_IN_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
@@ -87,13 +97,13 @@ def pdf_path_for(folder: Path, row: dict, has_record: bool = True) -> Path:
     """Where this row's PDF goes.
 
     Named the way venire names them, person id first, so the folder sorts in
-    spreadsheet order and a file can be matched back to a row by eye. A
-    no-results PDF carries a NO_RECORD tag so the two kinds are told apart in
-    the folder without opening them.
+    report order and a file can be matched back to a row by eye. A no-results
+    PDF carries a NO_RECORD tag so the two kinds are told apart in the folder
+    without opening them.
 
     Args:
         folder: This run's PDF folder.
-        row: One dict from Spreadsheet.load_rows.
+        row: One row dict from report_reader.
         has_record: False when the PDF is the CCIS no-results page.
 
     Returns:
@@ -115,6 +125,51 @@ def _describe(row: dict) -> str:
     return f"row {row['row']} ({row['last_name']}, {row['first_name']} / {identifier})"
 
 
+def report_session_config(config: dict) -> dict:
+    """A copy of config that points a StacSession at the report's STAC, read only.
+
+    The report is run on prod STAC. That session only ever runs the report
+    and downloads it, and the switches are forced off here as well, so even
+    a future change that handed it to the filing code could not upload or
+    save on prod.
+
+    Args:
+        config: From load_config.
+
+    Returns:
+        A new config dict. The original is not modified.
+    """
+    stac = dict(config["stac"])
+    stac.update(
+        url=config["report"]["url"],
+        upload_enabled=False,
+        save_enabled=False,
+        is_test_instance=False,
+    )
+    return {**config, "stac": stac}
+
+
+def _fetch_from_report_stac(config: dict) -> Path:
+    """Sign in to the report's STAC, download the report, and close that browser.
+
+    Closed before the filing STAC is opened, so there is never a prod window
+    sitting open while files are being uploaded.
+    """
+    logger.info("Fetching the report from %s (read only)", config["report"]["url"])
+    with StacSession(report_session_config(config)) as session:
+        return fetch_report(
+            session,
+            config["paths"]["reports"],
+            config["report"]["report_timeout"],
+            config["report"]["download_timeout"],
+        )
+
+
+def _problem_outcome(problem: str) -> str:
+    """The outcome to record for a row the reader could not use."""
+    return Outcome.NO_UCN if problem.startswith("no UCN") else Outcome.BAD_FORMAT
+
+
 def process_row(row: dict, ccis: CcisSession, runner: StacRunner, pdf_folder: Path) -> str:
     """Take one row from CCIS to STAC and return the outcome to write.
 
@@ -123,7 +178,7 @@ def process_row(row: dict, ccis: CcisSession, runner: StacRunner, pdf_folder: Pa
     place that would change if the two were ever overlapped.
 
     Args:
-        row: One dict from Spreadsheet.load_rows.
+        row: One row dict from report_reader.
         ccis: The open CCIS session.
         runner: The open STAC runner.
         pdf_folder: Where this run's PDFs are written.
@@ -174,7 +229,10 @@ def process_row(row: dict, ccis: CcisSession, runner: StacRunner, pdf_folder: Pa
     # Then STAC. The PDF stays on disk either way: it is the audit trail, and
     # the thing somebody would file by hand if this row needs it.
     try:
-        runner.enter_row(row["ucn"], row["case_number"], row["name"], [pdf_file])
+        runner.enter_row(
+            row["ucn"], row["case_number"], row["name"], [pdf_file],
+            row.get("case_url", ""),
+        )
     except SaveMayHaveHappened as error:
         # The one outcome that must never be retried.
         logger.error("%s: %s", _describe(row), error)
@@ -191,23 +249,21 @@ def process_row(row: dict, ccis: CcisSession, runner: StacRunner, pdf_folder: Pa
     return Outcome.REHEARSED if has_record else Outcome.REHEARSED_NO_RECORD
 
 
-def check(config: dict) -> int:
-    """Report what the config resolved to and what the spreadsheet holds, then stop.
+def check(config: dict, report: Path | None) -> int:
+    """Report what the config resolved to and, given an export, what it holds. Then stop.
 
-    Opens no browser and signs in to nothing, so it is safe to run against a
-    live config at any time. This is the first thing to run after filling in
-    config.yaml: it answers where the spreadsheet is being looked for, whether
-    the columns line up, and how many rows would actually be attempted, none of
-    which needs CCIS or STAC to be reachable.
+    Opens no browser, signs in to nothing and writes nothing, so it is safe
+    to run at any time. Without --report it checks only the config, since
+    fetching the report means signing in to STAC.
     """
     stac = config["stac"]
-    excel = config["excel"]
     paths = config["paths"]
 
     logger.info("=== config ===")
     logger.info("  CCIS url            %s", config["ccis"]["url"])
     logger.info("  CCIS login          loaded from Credential Manager")
-    logger.info("  STAC url            %s", stac["url"])
+    logger.info("  report from STAC    %s (read only)", config["report"]["url"])
+    logger.info("  filing to STAC      %s", stac["url"])
     logger.info("  STAC login          loaded from Credential Manager")
     logger.info("  test instance       %s", stac["is_test_instance"])
     logger.info("  Type/Subtype        %s", stac["document_type"] + "/" + stac["subtype"]
@@ -217,78 +273,75 @@ def check(config: dict) -> int:
     logger.info("  name check          %s", stac["check_name"])
     logger.info("  fresh browser       %s", stac["fresh_browser"])
 
+    logger.info(
+        "  report timeouts     %ss to load, %ss to download",
+        config["report"]["report_timeout"], config["report"]["download_timeout"],
+    )
+
     logger.info("=== paths ===")
-    logger.info("  spreadsheet         %s", excel["file"])
+    logger.info("  reports             %s", paths["reports"])
     logger.info("  PDFs                %s", Path(paths["pdfs"]) / str(date.today()))
     logger.info("  logs                %s", paths["logs"])
     logger.info("  chromedriver        %s", paths["chromedriver"] or "(let Selenium find one)")
 
-    logger.info("=== spreadsheet ===")
-    logger.info(
-        "  sheet %r, data from row %s", excel["sheet"], excel["first_data_row"]
-    )
-    for label, key in (
-        ("case number", "case_number_column"),
-        ("ucn", "ucn_column"),
-        ("name", "name_column"),
-        ("dob", "dob_column"),
-        ("outcome", "outcome_column"),
-        ("id", "id_column"),
-    ):
-        number = excel.get(key) or 0
-        where = f"column {chr(ord('A') + number - 1)}" if number else "not in this sheet"
-        logger.info("    %-12s %s", label, where)
+    if report is None:
+        logger.info(
+            "No --report given, so no export was read. Pass --report <file> to "
+            "check one already downloaded."
+        )
+        return EXIT_OK
 
-    with Spreadsheet(config) as sheet:
-        rows = sheet.load_rows()
+    logger.info("=== report export ===")
+    cells = report_reader.read_xls(report)
+    header_at, columns = report_reader.find_header(cells)
+    rows = report_reader.build_rows(cells, header_at, columns)
 
-        done = [row for row in rows if excel_handler.is_done(row)]
-        problems = [row for row in rows if not excel_handler.is_done(row) and row["problem"]]
-        todo = [row for row in rows if not excel_handler.is_done(row) and not row["problem"]]
+    problems = [row for row in rows if row["problem"]]
+    todo = [row for row in rows if not row["problem"]]
+    linked = [row for row in todo if row["case_url"]]
 
-        logger.info("  %s row(s) with data", len(rows))
-        logger.info("  %s would be attempted", len(todo))
-        logger.info("  %s already carry an outcome and would be skipped", len(done))
-        logger.info("  %s cannot be read and would be flagged", len(problems))
+    logger.info("  %s", report.name)
+    logger.info("  header on row %s", header_at + 1)
+    logger.info("  %s row(s) with data", len(rows))
+    logger.info("  %s would be attempted", len(todo))
+    logger.info("  %s of those have a case link", len(linked))
+    logger.info("  %s cannot be read and would be flagged", len(problems))
 
-        if problems:
-            logger.info("=== rows that would be flagged ===")
-            for row in problems:
-                logger.warning("  row %s: %s", row["row"], row["problem"])
+    if problems:
+        logger.info("=== rows that would be flagged ===")
+        for row in problems:
+            logger.warning("  row %s: %s", row["export_row"], row["problem"])
 
-        if todo:
-            # The first few, so the column mapping can be eyeballed. If the
-            # name and the case number have landed in each other's columns,
-            # this is where it shows.
-            logger.info("=== first rows that would be attempted ===")
-            for row in todo[:5]:
-                ccis_note = (
-                    f" (CCIS surname {row['search_last']!r})"
-                    if row["search_last"] != row["last_name"]
-                    else ""
-                )
-                logger.info(
-                    "  row %s | %s, %s%s | dob %s | ucn %s | case %s",
-                    row["row"], row["last_name"], row["first_name"], ccis_note,
-                    row["dob"], row["ucn"] or "-", row["case_number"] or "-",
-                )
-            if len(todo) > 5:
-                logger.info("  ... and %s more", len(todo) - 5)
+    if todo:
+        logger.info("=== first rows that would be attempted ===")
+        for row in todo[:CHECK_SAMPLE_ROWS]:
+            logger.info(
+                "  row %s | %s, %s (CCIS surname %r) | dob %s | ucn %s | link %s",
+                row["export_row"], row["last_name"], row["first_name"],
+                row["search_last"], row["dob"], row["ucn"],
+                "yes" if row["case_url"] else "no",
+            )
+        if len(todo) > CHECK_SAMPLE_ROWS:
+            logger.info("  ... and %s more", len(todo) - CHECK_SAMPLE_ROWS)
 
-    logger.info(
-        "Config and spreadsheet are readable. Nothing was signed in to and nothing "
-        "was changed."
-    )
+    logger.info("Config and export are readable. Nothing was signed in to and nothing was changed.")
     return EXIT_OK
 
 
-def run(config: dict, limit: int | None, fresh: bool, only_row: int | None) -> int:
-    """One pass down the spreadsheet.
+def run(config: dict, limit: int | None, only_row: int | None, report: Path | None) -> int:
+    """One pass over the report.
+
+    Args:
+        config: From load_config.
+        limit: Do only the first N rows that still need doing.
+        only_row: Do one row, by its row number in the working copy.
+        report: An export already downloaded. None fetches a fresh one.
 
     Raises:
-        SystemProblem: CCIS or STAC could not be opened, the spreadsheet could
-            not be saved, or MAX_CONSECUTIVE_FAILURES rows failed in a row.
-            Every outcome written before that point is already in the file.
+        SystemProblem: STAC or CCIS could not be opened, the report could not
+            be fetched or read, the working copy could not be saved, or
+            MAX_CONSECUTIVE_FAILURES rows failed in a row. Every outcome
+            written before that point is already in the working copy.
     """
     stac = config["stac"]
     pdf_folder = Path(config["paths"]["pdfs"]) / str(date.today())
@@ -301,8 +354,8 @@ def run(config: dict, limit: int | None, fresh: bool, only_row: int | None) -> i
     if not stac["upload_enabled"]:
         logger.info(
             "Rehearsal: stac.upload_enabled is false, so no file will reach STAC. "
-            "Every case is still found and every name still checked, which is what "
-            "this pass is for."
+            "Every case is still opened and every name still checked, which is "
+            "what this pass is for."
         )
         if not stac.get("pair_is_set"):
             logger.info(
@@ -319,41 +372,59 @@ def run(config: dict, limit: int | None, fresh: bool, only_row: int | None) -> i
                 "will not be pressed."
             )
 
-    with Spreadsheet(config) as sheet:
-        rows = sheet.load_rows()
+    # The report first, from its own STAC, with that browser closed again
+    # before anything is filed. Nothing else is signed in to until the report
+    # says there is work to do.
+    if report is None:
+        report = _fetch_from_report_stac(config)
+    else:
+        logger.info("Using the export already downloaded: %s", report.name)
 
-        if fresh:
-            cleared = excel_handler.clear_outcomes(sheet, rows)
-            logger.info("--fresh cleared %s outcome cell(s)", cleared)
+    working_copy, rows = report_reader.prepare_report(report)
 
+    # The report's links name the STAC it was run on. Filing may be on a
+    # different instance with the same incident ids, so the links are pointed
+    # there. Only in memory: the working copy keeps the links as exported.
+    retargeted = 0
+    for row in rows:
+        moved = report_reader.retarget_link(
+            row["case_url"], config["report"]["url"], stac["url"]
+        )
+        if moved != row["case_url"]:
+            row["case_url"] = moved
+            retargeted += 1
+    if retargeted:
+        logger.info(
+            "%s case link(s) pointed from the report's STAC at %s", retargeted, stac["url"]
+        )
+
+    with Spreadsheet(report_reader.working_copy_config(working_copy)) as sheet:
         if only_row is not None:
             rows = [row for row in rows if row["row"] == only_row]
             if not rows:
                 raise SystemProblem(
-                    f"--only-row {only_row} does not name a row with data in it."
+                    f"--only-row {only_row} does not name a row in {working_copy.name}."
                 )
+            # Whatever its outcome says, as the option promises.
+            rows[0]["outcome"] = ""
             logger.info("--only-row %s: one row this pass", only_row)
 
-        # Rows that cannot be processed get their outcome written now, before
-        # either browser opens. There is no point signing in to two systems to
-        # discover the sheet has a column problem.
+        already_done = sum(1 for row in rows if excel_handler.is_done(row))
+
+        # Rows that cannot be searched get their outcome written now, before
+        # either browser opens.
         todo = []
         for row in rows:
             if excel_handler.is_done(row):
                 continue
             if row["problem"]:
-                outcome = (
-                    Outcome.NO_UCN
-                    if "case number in this row" in row["problem"]
-                    else Outcome.BAD_FORMAT
-                )
+                outcome = _problem_outcome(row["problem"])
                 logger.warning("Row %s: %s", row["row"], row["problem"])
                 sheet.write_outcome(row["row"], outcome)
                 row["outcome"] = outcome
                 continue
             todo.append(row)
 
-        already_done = sum(1 for row in rows if excel_handler.is_done(row))
         if limit is not None:
             todo = todo[:limit]
             logger.info("--limit %s: %s row(s) this pass", limit, len(todo))
@@ -363,11 +434,12 @@ def run(config: dict, limit: int | None, fresh: bool, only_row: int | None) -> i
         )
 
         if not todo:
-            logger.info("Nothing to do. Use --fresh to clear the outcome column.")
+            logger.info("Nothing to do.")
             return EXIT_OK
 
         failures = 0
-        with CcisSession(config) as ccis, StacRunner(config) as runner:
+        # The filing STAC (stac.url) and CCIS, signed in to only now.
+        with StacRunner(config) as runner, CcisSession(config) as ccis:
             for position, row in enumerate(todo, start=1):
                 logger.info("--- %s of %s | %s", position, len(todo), _describe(row))
 
@@ -391,16 +463,16 @@ def run(config: dict, limit: int | None, fresh: bool, only_row: int | None) -> i
                 if failures >= MAX_CONSECUTIVE_FAILURES:
                     raise SystemProblem(
                         f"{failures} rows in a row failed. Stopping rather than "
-                        "working down the rest of the sheet against something that "
-                        "is not answering."
+                        "working down the rest of the report against something "
+                        "that is not answering."
                     )
 
-        _summarise(todo)
+        _summarise(todo, working_copy)
 
     return EXIT_OK
 
 
-def _summarise(rows: list) -> None:
+def _summarise(rows: list, working_copy: Path) -> None:
     """Count what happened, and say plainly what still needs a person."""
     counts = Counter(row["outcome"] for row in rows)
     logger.info("Rows this pass: %s", len(rows))
@@ -412,7 +484,7 @@ def _summarise(rows: list) -> None:
         logger.error(
             "%s row(s) are marked %r. Save was pressed and STAC never confirmed, so "
             "those rap sheets may or may not be on their cases. Check each one by "
-            "hand. A rerun will NOT retry them and --fresh will NOT clear them.",
+            "hand before running again.",
             unconfirmed, Outcome.CHECK_BY_HAND,
         )
 
@@ -428,14 +500,23 @@ def _summarise(rows: list) -> None:
     )
     if needs_a_person:
         logger.info(
-            "%s row(s) need a look. Filter the outcome column for anything that is "
-            "not %r.", needs_a_person, Outcome.FILED,
+            "%s row(s) need a look. Open %s and filter the Outcome column for "
+            "anything that is not %r.", needs_a_person, working_copy.name, Outcome.FILED,
         )
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse the command line, load config, and run or check.
+
+    Args:
+        argv: Command-line arguments, without the program name. None reads
+            sys.argv.
+
+    Returns:
+        EXIT_OK, EXIT_SYSTEM_PROBLEM or EXIT_CONFIG_PROBLEM.
+    """
     parser = argparse.ArgumentParser(
-        description="File CCIS case summaries onto their STAC cases, row by row."
+        description="File CCIS case summaries onto the cases in STAC's AutoCCIS report."
     )
     parser.add_argument(
         "--limit",
@@ -443,22 +524,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Do only the first N rows that still need doing. For testing.",
     )
     parser.add_argument(
-        "--fresh",
-        action="store_true",
-        help="Clear the outcome column first and start over. Rows marked "
-             "'CHECK BY HAND' are left alone.",
-    )
-    parser.add_argument(
         "--only-row",
         type=int,
         metavar="N",
-        help="Do one spreadsheet row by its row number, whatever its outcome says.",
+        help="Do one row by its row number in the working copy, whatever its outcome says.",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        metavar="FILE",
+        help="Use an export already downloaded instead of fetching the report. "
+             "Outcomes already in its working copy are kept.",
     )
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Report what the config resolved to and what the spreadsheet holds, "
-             "then stop. Opens no browser and signs in to nothing. Run this first.",
+        help="Report what the config resolved to, and with --report what the "
+             "export holds, then stop. Opens no browser and signs in to nothing.",
     )
     parser.add_argument(
         "--config",
@@ -473,6 +555,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--only-row must be at least 1")
     if args.only_row is not None and args.limit is not None:
         parser.error("--only-row and --limit do not make sense together")
+    if args.only_row is not None and args.report is None:
+        parser.error(
+            "--only-row needs --report: row numbers belong to one export's working copy"
+        )
+
+    report = args.report.resolve() if args.report else None
 
     # Logging is not set up yet, because the log folder comes from config.
     try:
@@ -486,8 +574,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.check:
-            return check(config)
-        return run(config, args.limit, args.fresh, args.only_row)
+            return check(config, report)
+        return run(config, args.limit, args.only_row, report)
     except ConfigProblem as error:
         logger.error("Config problem: %s", error)
         return EXIT_CONFIG_PROBLEM
@@ -497,7 +585,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         logger.warning(
             "Interrupted. Every row already attempted has its outcome in the "
-            "spreadsheet, so the next run resumes from here."
+            "working copy. Filed cases drop off the report, so the next run picks "
+            "up the rest."
         )
         return EXIT_SYSTEM_PROBLEM
     except Exception:

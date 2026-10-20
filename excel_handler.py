@@ -278,7 +278,7 @@ class Spreadsheet:
             self.close()
             raise ConfigProblem(
                 f"{self.path.name} has no sheet called {self.sheet_name!r}. "
-                f"It has: {available}. Set excel.sheet in config.yaml."
+                f"It has: {available}."
             )
 
         self._sheet = self._workbook[self.sheet_name]

@@ -39,8 +39,10 @@ class FakeRunner:
         )
         self.calls: list[tuple] = []
 
-    def enter_row(self, ucn: str, case_number: str, name: str, files: list) -> None:
-        self.calls.append((ucn, case_number, name, files))
+    def enter_row(
+        self, ucn: str, case_number: str, name: str, files: list, case_url: str = ""
+    ) -> None:
+        self.calls.append((ucn, case_number, name, files, case_url))
 
 
 def make_row(search_last: str = "DOE") -> dict:
@@ -87,6 +89,33 @@ class ProcessRowTests(unittest.TestCase):
         self.assertEqual(outcome, Outcome.REHEARSED_NO_RECORD)
         outcome, _ = self.run_row(ccis, FakeRunner(upload_enabled=True, save_enabled=False))
         self.assertEqual(outcome, Outcome.REACHED_SAVE_NO_RECORD)
+
+    def test_case_link_is_passed_to_stac(self):
+        runner = FakeRunner()
+        row = make_row()
+        row["case_url"] = "https://stac-test.example.com/incidents/00000"
+        self.run_row(FakeCcis(CcisResult(FAKE_PDF, True)), runner, row)
+        self.assertEqual(runner.calls[0][4], row["case_url"])
+
+    def test_report_session_can_never_upload_or_save(self):
+        config = {
+            "stac": {"url": "https://stac-test.example.com", "upload_enabled": True,
+                     "save_enabled": True, "is_test_instance": True},
+            "report": {"url": "https://stac-prod.example.org"},
+        }
+        prod = main.report_session_config(config)
+        self.assertEqual(prod["stac"]["url"], "https://stac-prod.example.org")
+        self.assertFalse(prod["stac"]["upload_enabled"])
+        self.assertFalse(prod["stac"]["save_enabled"])
+        # The original is untouched, so filing still goes to test.
+        self.assertEqual(config["stac"]["url"], "https://stac-test.example.com")
+        self.assertTrue(config["stac"]["save_enabled"])
+
+    def test_problem_outcomes(self):
+        self.assertEqual(main._problem_outcome("no UCN in this row"), Outcome.NO_UCN)
+        self.assertEqual(
+            main._problem_outcome("could not read the date of birth"), Outcome.BAD_FORMAT
+        )
 
     def test_ccis_problem_files_nothing(self):
         runner = FakeRunner()

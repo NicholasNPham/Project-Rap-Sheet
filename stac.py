@@ -32,6 +32,7 @@ import re
 import time
 from difflib import SequenceMatcher
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from selenium import webdriver
 from selenium.common.exceptions import (
@@ -103,6 +104,14 @@ SEARCH_BUTTON_ID = "incidentsSearchMainButton"
 NO_RECORDS_CSS = ".k-grid-norecords-template"
 CASE_DEFENDANT_NAME_CSS = "td[data-original-column-name='Def_Name'] span.k-button-text"
 IMAGES_TAB_ID = "incidentsTab-tab-3"
+
+# The case page a report link opens. The defendant is a directory-card button
+# in the title bar whose id carries STAC's directory id, so only the prefix is
+# matched. The <i> icon inside the button shares the k-button-text class,
+# hence span.
+CASE_PAGE_DEFENDANT_CSS = (
+    "button[id^='incidentTitlePageincidentTitleDirId'] span.k-button-text"
+)
 
 # Add image: dropzone and tiles
 IMAGE_TILE_UNSELECTED_CSS = "#image-manager-listview-name .cipimage:not(.k-selected)"
@@ -459,6 +468,9 @@ class StacSession:
         # STAC keeps the chosen search criterion, so the dropdown only needs
         # touching when it has to change. Reset whenever a new browser opens.
         self._criteria = ""
+        # The signed-in tab. Each case opened from a report link gets a tab of
+        # its own, and this is where the session goes back to afterwards.
+        self._main_handle: str | None = None
 
     @property
     def pair(self) -> str:
@@ -512,6 +524,8 @@ class StacSession:
         except Exception:
             self.close()
             raise
+
+        self._main_handle = self.driver.current_window_handle
 
     def _start_chrome(self) -> webdriver.Chrome:
         """Start Chrome, trying each way of finding chromedriver in turn.
@@ -618,6 +632,7 @@ class StacSession:
         finally:
             self.driver = None
             self.wait = None
+            self._main_handle = None
 
     @staticmethod
     def _settle() -> None:
@@ -962,6 +977,107 @@ class StacSession:
             f"{sorted(_name_tokens(stac_name))} against "
             f"{sorted(_name_tokens(expected_name))}."
         )
+
+    # ------------------------------------------------------ case from a link
+
+    def link_is_ours(self, url: str) -> bool:
+        """True when a report link points at the STAC instance this run is signed in to.
+
+        The report is exported from live STAC, so its links name live STAC.
+        A run pointed at test STAC must never follow one: that would open,
+        and with uploads on, file onto a real case. Comparing hosts is what
+        stops it.
+
+        Args:
+            url: The link from the report row.
+
+        Returns:
+            True only for an http(s) link on the configured host.
+        """
+        parts = urlsplit(url or "")
+        ours = urlsplit(self.url)
+        return parts.scheme in ("http", "https") and (
+            parts.netloc.lower() == ours.netloc.lower()
+        )
+
+    def open_case_from_link(self, url: str, ucn: str = "", expected_name: str = "") -> str:
+        """Open a case from its report link in a new tab, check it, and open Images.
+
+        The same thing clicking the link in the report does: a new tab on the
+        case, already signed in. A tab per case means whatever a row leaves
+        behind, an unsaved upload or an open dialog, goes when the tab closes
+        and never reaches the next row.
+
+        Args:
+            url: The case link from the report row. The caller has already
+                checked it with link_is_ours.
+            ucn: The row's UCN, for log lines and messages only.
+            expected_name: The name from the same row, checked against the
+                case page's defendant.
+
+        Returns:
+            The defendant name the case page shows.
+
+        Raises:
+            RowProblem: The defendant does not match the row's name.
+            SystemProblem: The tab would not open or the case page never
+                showed a defendant. An expired sign-in lands here too, since
+                STAC then shows its login page instead, and the runner's retry
+                signs in again.
+        """
+        try:
+            self.driver.switch_to.new_window("tab")
+            self.driver.get(url)
+        except WebDriverException as error:
+            raise SystemProblem(f"Could not open the case link in a new tab: {error}") from error
+
+        try:
+            self.wait.until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, CASE_PAGE_DEFENDANT_CSS))
+            )
+        except TimeoutException as error:
+            raise SystemProblem(
+                "The case page from the report link never showed a defendant name. "
+                "Either the sign-in expired or the case page has changed."
+            ) from error
+
+        names = [
+            element.text.strip()
+            for element in self.driver.find_elements(By.CSS_SELECTOR, CASE_PAGE_DEFENDANT_CSS)
+            if element.text.strip()
+        ]
+        if not names:
+            raise SystemProblem("The case page's defendant name was empty.")
+        if len(names) > 1:
+            # Not expected from the title bar. Checked against the first, and
+            # said so, rather than quietly accepting a match on any of them.
+            logger.warning(
+                "Case page lists %s defendant names; checking the first", len(names)
+            )
+
+        stac_name = names[0]
+        label = ucn or "this case"
+        self._pause("case opened from the report link")
+        self._check_defendant(label, stac_name, expected_name)
+        self._open_images_tab(label)
+        self._pause("images tab open")
+        return stac_name
+
+    def close_case_tab(self) -> None:
+        """Close the case tab and go back to the signed-in tab. Never raises.
+
+        Safe to call when no case tab is open. If the browser is already
+        gone, there is nothing to close, and the runner's restart deals with
+        it.
+        """
+        if self.driver is None or self._main_handle is None:
+            return
+        try:
+            if self.driver.current_window_handle != self._main_handle:
+                self.driver.close()
+            self.driver.switch_to.window(self._main_handle)
+        except WebDriverException as error:
+            logger.warning("Could not close the case tab cleanly: %s", error)
 
     def _open_images_tab(self, ucn: str) -> None:
         """Open the case's Images tab, where documents are added."""
@@ -1801,9 +1917,19 @@ class StacRunner:
             logger.warning("Could not restart the browser after a failure: %s", error)
 
     def enter_row(
-        self, ucn: str, case_number: str, sheet_name: str, paths: list
+        self,
+        ucn: str,
+        case_number: str,
+        sheet_name: str,
+        paths: list,
+        case_url: str = "",
     ) -> None:
         """File one row's PDF on its case, retrying once if STAC wedges.
+
+        With a usable report link the case opens in a tab of its own, the way
+        clicking the link does, and the tab is closed afterwards whatever
+        happened. Without one, the case is searched for by UCN on the signed-in
+        tab, as before.
 
         Args:
             ucn: UCN from the row. Tried first.
@@ -1814,6 +1940,9 @@ class StacRunner:
                 unless check_name is off.
             paths: The PDF to file. A list because a STAC upload box takes
                 several and every row here shares one Type/Subtype.
+            case_url: The row's link from the report, or "". A link to any
+                host other than the configured STAC is never opened; the UCN
+                search on the configured instance is used instead.
 
         Raises:
             RowProblem: This row needs a person. Nothing was filed.
@@ -1824,10 +1953,27 @@ class StacRunner:
         """
         identifier = ucn or case_number
 
+        use_link = bool(case_url) and self.session.link_is_ours(case_url)
+        if case_url and not use_link:
+            logger.info(
+                "%s: report link is not on %s, so it is not opened. Searching by "
+                "UCN on this instance instead.",
+                identifier, urlsplit(self.session.url).netloc,
+            )
+
         for attempt in range(1, self.max_attempts + 1):
             try:
-                self.session.find_case(ucn, case_number, sheet_name)
-                self.session.add_documents(identifier, paths)
+                if use_link:
+                    try:
+                        self.session.open_case_from_link(case_url, identifier, sheet_name)
+                        self.session.add_documents(identifier, paths)
+                    finally:
+                        # The tab holds everything this row did. Closing it is
+                        # the cleanup, success or not.
+                        self.session.close_case_tab()
+                else:
+                    self.session.find_case(ucn, case_number, sheet_name)
+                    self.session.add_documents(identifier, paths)
 
                 if self.fresh_browser:
                     # Close Chrome and sign in again, so the next row starts
@@ -1840,7 +1986,10 @@ class StacRunner:
                 # Both are this row's problem, and neither improves by trying
                 # again. SaveMayHaveHappened especially: a retry is exactly
                 # what would file it twice.
-                self._leave_browser_clean()
+                if not use_link:
+                    # A link row's mess went with its tab. A search row's is
+                    # still on the signed-in tab, so the browser goes.
+                    self._leave_browser_clean()
                 raise
 
             except SystemProblem as error:

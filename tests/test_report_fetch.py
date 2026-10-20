@@ -1,0 +1,62 @@
+"""Unit tests for report_fetch's download watching. No browser, made-up files only."""
+
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+import report_fetch as rf  # noqa: E402
+from exceptions import SystemProblem  # noqa: E402
+
+
+class DownloadWatchTests(unittest.TestCase):
+    def setUp(self):
+        self._folder = tempfile.TemporaryDirectory()
+        self.folder = Path(self._folder.name)
+        # An export from an earlier run, which must never be picked up.
+        (self.folder / "AutoCCIS.xls").write_bytes(b"old")
+        self.before = rf._files_in(self.folder)
+
+    def tearDown(self):
+        self._folder.cleanup()
+
+    def test_old_files_are_not_new(self):
+        self.assertEqual(rf._new_files(self.folder, self.before), [])
+        self.assertFalse(rf._wait_for_start(self.folder, self.before, 0.2))
+
+    def test_partial_download_counts_as_started_but_not_finished(self):
+        (self.folder / "AutoCCIS (1).xls.crdownload").write_bytes(b"half")
+        self.assertTrue(rf._wait_for_start(self.folder, self.before, 0.2))
+        with self.assertRaises(SystemProblem):
+            rf._wait_for_finish(self.folder, self.before, 1.5)
+
+    def test_finished_download_is_returned_once_size_holds(self):
+        (self.folder / "AutoCCIS (1).xls").write_bytes(b"made-up export")
+        found = rf._wait_for_finish(self.folder, self.before, 3)
+        self.assertEqual(found.name, "AutoCCIS (1).xls")
+
+    def test_waits_for_chrome_to_rename_the_partial(self):
+        partial = self.folder / "AutoCCIS (1).xls.crdownload"
+        partial.write_bytes(b"made-up export")
+
+        def finish() -> None:
+            time.sleep(0.6)
+            partial.rename(self.folder / "AutoCCIS (1).xls")
+
+        threading.Thread(target=finish).start()
+        found = rf._wait_for_finish(self.folder, self.before, 5)
+        self.assertEqual(found.name, "AutoCCIS (1).xls")
+
+    def test_empty_file_is_not_finished(self):
+        (self.folder / "AutoCCIS (1).xls").write_bytes(b"")
+        with self.assertRaises(SystemProblem):
+            rf._wait_for_finish(self.folder, self.before, 1.5)
+
+
+if __name__ == "__main__":
+    unittest.main()
