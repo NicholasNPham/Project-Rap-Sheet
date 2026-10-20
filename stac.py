@@ -85,6 +85,13 @@ SEARCH_CRITERIA_LISTBOX_OPEN_XPATH = (
 )
 SEARCH_CRITERIA_OPTIONS_CSS = "ul#incidentsSearchMainCriteria_listbox span"
 
+# The value the closed dropdown shows. Kendo renders the pick here a beat
+# after the option click, and a search sent before then runs on the old
+# criterion.
+SEARCH_CRITERIA_SHOWN_CSS = (
+    "[aria-controls='incidentsSearchMainCriteria_listbox'] .k-input-value-text"
+)
+
 # What the Case Number criterion might be called. STAC's own label is not
 # known, so each is tried in turn and the first that the dropdown offers
 # wins, the same approach TYPE_INPUT_SELECTORS takes to the Type field. The
@@ -834,6 +841,15 @@ class StacSession:
             except (TimeoutException, WebDriverException):
                 continue
 
+            if not self._criteria_shows(label):
+                logger.warning(
+                    "Clicked %r in STAC's search dropdown, but it still shows %r. "
+                    "Not searching on a criterion that did not take.",
+                    label, self._criteria_shown(),
+                )
+                self._close_dropdown()
+                return False
+
             self._criteria = label
             logger.debug("Search criteria set to %r", label)
             return True
@@ -845,6 +861,33 @@ class StacSession:
         )
         self._close_dropdown()
         return False
+
+    def _criteria_shows(self, label: str) -> bool:
+        """Wait for the list to close and the dropdown to show `label`.
+
+        Args:
+            label: The criterion just clicked.
+
+        Returns:
+            True once both are true, False if they are not within wait_timeout.
+        """
+        try:
+            self.wait.until(EC.invisibility_of_element_located(
+                (By.XPATH, SEARCH_CRITERIA_LISTBOX_OPEN_XPATH)
+            ))
+            self.wait.until(lambda _: self._criteria_shown() == label)
+        except TimeoutException:
+            return False
+        return True
+
+    def _criteria_shown(self) -> str:
+        """The criterion the closed dropdown is showing, or '' if it cannot be read."""
+        try:
+            return self.driver.find_element(
+                By.CSS_SELECTOR, SEARCH_CRITERIA_SHOWN_CSS
+            ).text.strip()
+        except WebDriverException:
+            return ""
 
     def _criteria_on_offer(self) -> str:
         """The labels STAC's criteria dropdown actually lists, for an error message.
