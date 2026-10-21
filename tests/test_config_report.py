@@ -30,7 +30,7 @@ class ReportSettingsTests(unittest.TestCase):
         cl._validate_report(config)
         self.assertEqual(
             config["report"],
-            {"url": PROD_URL.rstrip("/"), "report_timeout": 180, "download_timeout": 60},
+            {"url": PROD_URL.rstrip("/"), "report_timeout": 180, "download_timeout": 120},
         )
 
     def test_report_url_is_required(self):

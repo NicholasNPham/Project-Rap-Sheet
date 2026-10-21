@@ -5,9 +5,11 @@ The clicks, from the signed-in page:
     Cases (sidebar)  ->  Report (case menu)  ->  Search  ->  Excel export
 
 The report form arrives already filled in, so Search needs nothing typed.
-After Search the report goes through several loading phases before the export
-button does anything, so the wait is on the button being usable with no
-loading mask on screen, not on a fixed sleep.
+Search opens a Report Preview window at once, with its Save As toolbar and
+Excel button ready, but the viewer frame under the toolbar stays blank for a
+while before the report appears in it. Clicking export in that gap makes STAC
+build the whole report before it sends anything, so the wait is on the viewer
+having filled in, not on the button or a fixed sleep.
 
 Chrome is told, through the DevTools protocol, to download into a folder this
 run chooses, so the file never has to be fished out of the user's Downloads.
@@ -38,7 +40,50 @@ logger = get_logger(__name__)
 # The clicks. Selectors from STAC's own markup.
 REPORT_MENU_CSS = "li[data-button-id='report']"
 REPORT_SEARCH_BUTTON_ID = "pagesIncidentReportsIndexFrm_report_button"
-EXCEL_EXPORT_CSS = "button.report-export-btn[data-format='Excel']"
+EXCEL_EXPORT_CSS = "#reportPreviewWindow button.report-export-btn[data-format='Excel']"
+
+# Says whether the report list has loaded with the wanted report selected.
+# The Search button is clickable about three seconds before the list exists,
+# and Search pressed in that gap gets "Please select a report." Watched by
+# hand, the row arrived already selected in the grid, so this waits for that
+# rather than selecting anything itself. Matched on the row's text: its id
+# and data-uid are fresh GUIDs on every load.
+REPORT_SELECTED_JS = r"""
+var wanted = arguments[0];
+var cells = document.querySelectorAll('tr.k-master-row td');
+var row = null;
+for (var i = 0; i < cells.length; i++) {
+  if ((cells[i].textContent || '').trim() === wanted) { row = cells[i].closest('tr'); break; }
+}
+if (!row) { return 'no-row'; }
+var gridEl = row.closest('.k-grid');
+var grid = (gridEl && window.jQuery) ? window.jQuery(gridEl).data('kendoGrid') : null;
+if (!grid) { return 'no-grid'; }
+var picked = grid.select();
+if (!picked || picked.length === 0) { return 'nothing-selected'; }
+return picked[0] === row ? 'ok' : 'other-selected';
+"""
+
+# Seconds to wait for the report list. It took about three by hand; this is
+# well past that so a slow STAC is not mistaken for a missing report.
+REPORT_LIST_SECONDS = 60
+
+# What each answer from REPORT_SELECTED_JS means, for the error if the wait
+# runs out.
+REPORT_LIST_STATES = {
+    "no-row": "the report list never showed a row named {name}",
+    "no-grid": "the {name} row is not in a grid STAC's code can read",
+    "nothing-selected": "the {name} row is there but no report is selected",
+    "other-selected": "a report other than {name} is selected",
+}
+
+# The viewer frame inside the preview window. Matched on the page name only:
+# the rest of its src is session tokens that change on every load.
+VIEWER_FRAME_CSS = "#reportPreviewWindow iframe[src*='viewer.aspx']"
+
+# How much text the viewer shows. Only the length comes back, never the text,
+# which is the report's rows.
+VIEWER_TEXT_LENGTH_JS = "return document.body ? document.body.innerText.trim().length : 0;"
 
 # The dialog STAC shows when Search is pressed before the form has filled in
 # its default report. Matched on its text, and Ok as the next button after
@@ -53,12 +98,15 @@ SEARCH_RETRY_PAUSE_SECONDS = 2
 SEARCH_ATTEMPTS = 3
 
 # Anything Kendo or the report viewer shows while it is still working. The
-# export is only clicked once none of these is visible.
+# export is only clicked once none of these is visible inside the viewer.
+# The viewer has not been seen to show one, so filling in is the real test;
+# this is a guard in case it ever does.
 LOADING_CSS = ".k-loading-mask, .k-loading-image, .k-loader, .k-i-loading"
 
-# Seconds. The report takes a while to build; the download is small.
+# Seconds. The report takes a while to build. The download is small, but STAC
+# builds the export after the click and has taken about a minute to send it.
 DEFAULT_REPORT_TIMEOUT = 180
-DEFAULT_DOWNLOAD_TIMEOUT = 60
+DEFAULT_DOWNLOAD_TIMEOUT = 120
 
 # Seconds to wait for a download to begin after clicking export. If nothing
 # appears in that time the click most likely landed before the report was
@@ -113,6 +161,7 @@ def fetch_report(
 
     _click(wait, driver, (By.CSS_SELECTOR, CASES_SIDEBAR_CSS), "the Cases sidebar")
     _click(wait, driver, (By.CSS_SELECTOR, REPORT_MENU_CSS), "Report in the case menu")
+    _wait_for_report_selected(driver, REPORT_LIST_SECONDS)
     _start_search(wait, driver)
     logger.info("Report search started, waiting for it to load")
 
@@ -121,9 +170,6 @@ def fetch_report(
     for attempt in range(1, EXPORT_CLICK_ATTEMPTS + 1):
         button = _wait_for_export(driver, report_timeout)
         driver.execute_script("arguments[0].click();", button)
-        # The button may have been inside the viewer's iframe. Everything
-        # after this works from the top-level page.
-        driver.switch_to.default_content()
         logger.info("Clicked Excel export (try %s of %s)", attempt, EXPORT_CLICK_ATTEMPTS)
 
         if not _wait_for_start(download_dir, before, DOWNLOAD_START_SECONDS):
@@ -195,6 +241,40 @@ def _click(wait: WebDriverWait, driver, locator: tuple, what: str) -> None:
         raise SystemProblem(f"Could not click {what}; it never became clickable.") from error
 
 
+def _wait_for_report_selected(driver, timeout: int) -> None:
+    """Wait until the report list has loaded with the AutoCCIS report selected.
+
+    Args:
+        driver: The report STAC's WebDriver, on the report page.
+        timeout: Seconds to wait.
+
+    Raises:
+        SystemProblem: The list did not reach that state in time. Searching
+            anyway would run nothing, or run the wrong report.
+    """
+    last_state = "no-row"
+
+    def selected(driver) -> bool:
+        nonlocal last_state
+        try:
+            last_state = driver.execute_script(REPORT_SELECTED_JS, REPORT_NAME)
+        except WebDriverException:
+            # The page swapping in the report form looks like this. The next
+            # look tries again.
+            return False
+        return last_state == "ok"
+
+    try:
+        WebDriverWait(driver, timeout, poll_frequency=POLL_SECONDS).until(selected)
+    except TimeoutException as error:
+        why = REPORT_LIST_STATES.get(last_state, f"its state was {last_state!r}")
+        raise SystemProblem(
+            f"The report page was not ready to search after {timeout}s: "
+            f"{why.format(name=REPORT_NAME)}."
+        ) from error
+    logger.info("Report list loaded with %s selected", REPORT_NAME)
+
+
 def _start_search(wait: WebDriverWait, driver) -> None:
     """Press the report's Search, again if STAC says no report is selected yet.
 
@@ -256,49 +336,72 @@ def _dismiss_not_ready(driver) -> bool:
     return True
 
 
-def _find_export(driver) -> WebElement | None:
-    """The Excel export button if it is usable and nothing is loading, else None.
+def _viewer_text_length(driver) -> int:
+    """How much text the report viewer is showing, or 0 if it is not ready.
 
-    Looks in the page and then in each iframe on it, since the report viewer
-    lives in one and the button may sit inside it. Always leaves the driver
-    on the top-level page, except when it returns a button inside a frame,
-    in which case it leaves the driver in that frame so the button can be
-    clicked.
+    0 while the viewer frame is missing, its page is still loading, or a
+    loading indicator shows inside it. Always leaves the driver on the
+    top-level page.
+
+    Returns:
+        The length of the viewer's text, or 0.
     """
     driver.switch_to.default_content()
-    contexts = [None] + driver.find_elements(By.TAG_NAME, "iframe")
+    try:
+        frames = driver.find_elements(By.CSS_SELECTOR, VIEWER_FRAME_CSS)
+        if not frames:
+            return 0
+        driver.switch_to.frame(frames[0])
+        if driver.execute_script("return document.readyState") != "complete":
+            return 0
+        if any(el.is_displayed() for el in driver.find_elements(By.CSS_SELECTOR, LOADING_CSS)):
+            return 0
+        return int(driver.execute_script(VIEWER_TEXT_LENGTH_JS) or 0)
+    except WebDriverException:
+        # The frame reloading under us looks like this. Not ready yet; the
+        # next look tries again.
+        return 0
+    finally:
+        driver.switch_to.default_content()
 
-    for frame in contexts:
-        try:
-            driver.switch_to.default_content()
-            if frame is not None:
-                driver.switch_to.frame(frame)
-            if any(el.is_displayed() for el in driver.find_elements(By.CSS_SELECTOR, LOADING_CSS)):
-                driver.switch_to.default_content()
-                return None
-            for button in driver.find_elements(By.CSS_SELECTOR, EXCEL_EXPORT_CSS):
-                if button.is_displayed() and button.is_enabled():
-                    return button
-        except WebDriverException:
-            continue
 
-    driver.switch_to.default_content()
+def _find_export(driver) -> WebElement | None:
+    """The preview window's Excel export button if it is usable, else None."""
+    try:
+        for button in driver.find_elements(By.CSS_SELECTOR, EXCEL_EXPORT_CSS):
+            if button.is_displayed() and button.is_enabled():
+                return button
+    except WebDriverException:
+        pass
     return None
 
 
 def _wait_for_export(driver, timeout: int) -> WebElement:
-    """Wait until the report has loaded and the Excel export can be clicked.
+    """Wait until the report preview has filled in, then return its Excel button.
+
+    Filled in means the viewer shows some text and the amount has held
+    steady across two looks a second apart, so a report still drawing is not
+    taken as done.
 
     Raises:
-        SystemProblem: The report did not finish within `timeout` seconds.
+        SystemProblem: The preview did not fill in within `timeout` seconds,
+            or its Excel button never became usable.
     """
+    last_length = -1
+
+    def ready(driver) -> WebElement | None:
+        nonlocal last_length
+        length = _viewer_text_length(driver)
+        settled = length > 0 and length == last_length
+        last_length = length
+        return _find_export(driver) if settled else None
+
     try:
-        return WebDriverWait(driver, timeout, poll_frequency=1).until(_find_export)
+        return WebDriverWait(driver, timeout, poll_frequency=1).until(ready)
     except TimeoutException as error:
-        driver.switch_to.default_content()
         raise SystemProblem(
-            f"The report did not finish loading within {timeout}s, or its Excel "
-            "export button never appeared."
+            f"The report preview did not fill in within {timeout}s, or its "
+            "Excel export button never became usable."
         ) from error
 
 

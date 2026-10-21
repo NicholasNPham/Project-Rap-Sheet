@@ -92,11 +92,12 @@ DEFAULTS = {
         "pause_between_actions": 1,
         "headless": False,
     },
-    # Seconds. The report takes a while to build through its loading phases;
-    # the download itself is small.
+    # Seconds. The report takes a while to build through its loading phases.
+    # The download is small, but STAC builds the export after the click and
+    # has taken about a minute to send it.
     "report": {
         "report_timeout": 180,
-        "download_timeout": 60,
+        "download_timeout": 120,
     },
     "paths": {
         "logs": "logs",

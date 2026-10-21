@@ -120,8 +120,9 @@ report:
   # Seconds to wait for the report to finish its loading phases before the
   # export button is clicked.
   report_timeout: 180
-  # Seconds to wait for the download once it has started.
-  download_timeout: 60
+  # Seconds to wait for the download once it has started. STAC builds the
+  # export after the click, which has taken about a minute.
+  download_timeout: 120
 
 # Paths, relative to the project root unless absolute.
 paths:
