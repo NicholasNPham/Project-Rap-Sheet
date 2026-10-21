@@ -94,10 +94,10 @@ DEFAULTS = {
     },
     # Seconds. The report takes a while to build through its loading phases.
     # The download is small, but STAC builds the export after the click and
-    # has taken about a minute to send it.
+    # has taken over a minute to send it.
     "report": {
         "report_timeout": 180,
-        "download_timeout": 120,
+        "download_timeout": 300,
     },
     "paths": {
         "logs": "logs",

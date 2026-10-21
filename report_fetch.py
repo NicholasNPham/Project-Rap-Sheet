@@ -104,9 +104,12 @@ SEARCH_ATTEMPTS = 3
 LOADING_CSS = ".k-loading-mask, .k-loading-image, .k-loader, .k-i-loading"
 
 # Seconds. The report takes a while to build. The download is small, but STAC
-# builds the export after the click and has taken about a minute to send it.
+# builds the export after the click, and its partial file can sit unchanged
+# for over a minute before the whole thing arrives at once. A slow export and
+# a stuck one look the same from the folder, so the download wait is a hard
+# cap set well past the slowest seen rather than a check for progress.
 DEFAULT_REPORT_TIMEOUT = 180
-DEFAULT_DOWNLOAD_TIMEOUT = 120
+DEFAULT_DOWNLOAD_TIMEOUT = 300
 
 # Seconds to wait for a download to begin after clicking export. If nothing
 # appears in that time the click most likely landed before the report was
@@ -476,4 +479,13 @@ def _wait_for_finish(folder: Path, before: set[str], seconds: float) -> Path:
             last_size = size
         time.sleep(POLL_SECONDS)
 
-    raise SystemProblem(f"The export was still downloading after {seconds}s.")
+    new = _new_files(folder, before)
+    if any(p.suffix.lower() in PARTIAL_SUFFIXES for p in new):
+        raise SystemProblem(
+            f"The export was still downloading after {seconds}s: Chrome had a partial "
+            "file that never completed."
+        )
+    raise SystemProblem(
+        f"The export never settled into a finished file within {seconds}s "
+        f"({len(new)} new file(s), none complete and non-empty)."
+    )

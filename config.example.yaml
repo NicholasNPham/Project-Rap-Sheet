@@ -121,8 +121,9 @@ report:
   # export button is clicked.
   report_timeout: 180
   # Seconds to wait for the download once it has started. STAC builds the
-  # export after the click, which has taken about a minute.
-  download_timeout: 120
+  # export after the click, which has taken over a minute, and a slow export
+  # looks the same as a stuck one, so this is a generous hard cap.
+  download_timeout: 300
 
 # Paths, relative to the project root unless absolute.
 paths:
