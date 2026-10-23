@@ -666,8 +666,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Config problem: {error}", file=sys.stderr)
         return EXIT_CONFIG_PROBLEM
 
-    log_path = Path(config["paths"]["logs"]) / f"{date.today()}.log"
-    setup_logging(log_path)
+    setup_logging(Path(config["paths"]["logs"]))
 
     try:
         if args.check:
