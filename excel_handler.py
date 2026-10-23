@@ -37,18 +37,27 @@ MAX_SPLIT_PARAMETER = 1
 FIRST_NAME_SPLIT_PARAMETER = 0
 COMMA_DELIMITER = ","
 
+# CCIS may index a compound name under only part of it, so a miss on the full
+# name is retried with parts of it before "no record" is believed. A hyphen
+# breaks a surname into parts the same way a space does. The given name is
+# tried as one word and then two: past that it is middle names, and every
+# extra word adds another round of surname searches for a row that CCIS has
+# already missed.
+SURNAME_PART_BREAK = "-"
+MAX_GIVEN_WORDS = 2
+
 # Generational suffixes, which the sheet puts in the surname field:
 #
 # They are stripped for the CCIS search and kept everywhere else. CCIS indexes
 # the surname on its own, so searching it for a last name of "DOE III"
-# finds nothing, and the row would then be recorded as a compound-surname
-# warning when the real surname is one plain word. The full cell is still what
+# finds nothing, and the row would then be searched again under "DOE" and
+# "III" when the real surname is one plain word. The full cell is still what
 # STAC's defendant name is checked against, where the suffix is harmless: the
 # name check accepts one name's words being a subset of the other's.
 #
 # Only a trailing suffix is removed, and only when something is left over, so
-# a genuine compound surname like "LOPEZ CRUZ" is untouched and still gets the
-# warning it deserves.
+# a genuine compound surname like "LOPEZ CRUZ" is untouched and still has its
+# parts searched.
 NAME_SUFFIXES = frozenset({
     "JR", "JR.", "SR", "SR.", "I", "II", "III", "IV", "V", "VI", "VII",
 })
@@ -75,6 +84,11 @@ class Outcome:
     FILED_NO_RECORD = "Filed in STAC - no CCIS record"
     REACHED_SAVE_NO_RECORD = "Reached save - not pressed (no CCIS record)"
     REHEARSED_NO_RECORD = "Rehearsed - nothing uploaded (no CCIS record)"
+    # The full name missed and part of it hit. Filed like any record, but
+    # labeled so the few matched this way can be spot-checked.
+    FILED_PARTIAL_NAME = "Filed in STAC - found under part of the name"
+    REACHED_SAVE_PARTIAL_NAME = "Reached save - not pressed (found under part of the name)"
+    REHEARSED_PARTIAL_NAME = "Rehearsed - nothing uploaded (found under part of the name)"
     # No longer written: a no-record row is filed now, compound surname or not.
     # Kept so sheets from earlier runs still read as finished.
     NO_CCIS_RECORD = "No matches found in CCIS"
@@ -97,6 +111,9 @@ Outcome.TERMINAL = frozenset({
     Outcome.FILED_NO_RECORD,
     Outcome.REACHED_SAVE_NO_RECORD,
     Outcome.REHEARSED_NO_RECORD,
+    Outcome.FILED_PARTIAL_NAME,
+    Outcome.REACHED_SAVE_PARTIAL_NAME,
+    Outcome.REHEARSED_PARTIAL_NAME,
     Outcome.NO_CCIS_RECORD,
     Outcome.COMPOUND_NAME,
     Outcome.NO_UCN,
@@ -165,6 +182,59 @@ def strip_suffix(last_name: str) -> str:
         words.pop()
 
     return " ".join(words)
+
+
+def search_variants(name: str) -> list[tuple[str, str]]:
+    """List the (first, last) pairs to search CCIS with, most likely first.
+
+    The first pair is the ordinary search: the first given word and the
+    surname without its suffix. The rest are only worth trying once that one
+    has missed. Words never cross the comma and never change order, so every
+    pair is a name the person could legally be indexed under. Surname runs come
+    longest first, and each surname run is tried with one given word before
+    any is tried with two, because the surname is where indexing differs and
+    a second given word is usually a middle name.
+
+    Args:
+        name: Full name string ex: 'Doe Smith, John Paul'
+
+    Returns:
+        The pairs in search order, without repeats, ex:
+        [('John', 'Doe Smith'), ('John', 'Doe'), ('John', 'Smith'),
+         ('John Paul', 'Doe Smith'), ('John Paul', 'Doe'), ('John Paul', 'Smith')]
+        An empty list when parse_name cannot split the name.
+
+    Example:
+        search_variants("Doe, John")        ->  [("John", "Doe")]
+        search_variants("Doe-Smith, John")  ->  [("John", "Doe-Smith"),
+                                                 ("John", "Doe"), ("John", "Smith")]
+    """
+    first_name, last_name = parse_name(name)
+    if not first_name or not last_name:
+        return []
+
+    surname = strip_suffix(last_name)
+    parts = surname.replace(SURNAME_PART_BREAK, " ").split()
+    # Every contiguous run of the parts, longest first. The whole surname is
+    # searched as written, hyphen included, so it is not repeated as a run.
+    surnames = [surname]
+    for length in range(len(parts) - 1, 0, -1):
+        for start in range(len(parts) - length + 1):
+            surnames.append(" ".join(parts[start:start + length]))
+
+    given = name.split(COMMA_DELIMITER, MAX_SPLIT_PARAMETER)[1].split()
+    # strip_suffix keeps "Doe, John Jr" from searching a first name of "John Jr".
+    firsts = [
+        strip_suffix(" ".join(given[:count]))
+        for count in range(1, min(len(given), MAX_GIVEN_WORDS) + 1)
+    ]
+
+    variants = []
+    for first in firsts:
+        for last in surnames:
+            if (first, last) not in variants:
+                variants.append((first, last))
+    return variants
 
 
 def format_dob(dob) -> str | None:

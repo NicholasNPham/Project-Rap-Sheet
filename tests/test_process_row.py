@@ -30,6 +30,25 @@ class FakeCcis:
         return self._result
 
 
+class ScriptedCcis:
+    """Stands in for CcisSession; finds a record only for the listed (first, last) pairs.
+
+    Each result's PDF is numbered by search, so a test can tell which one was filed.
+    """
+
+    def __init__(self, hits: set = frozenset(), error_on: int | None = None):
+        self._hits = hits
+        self._error_on = error_on
+        self.searches: list[tuple] = []
+
+    def fetch_pdf(self, first_name: str, last_name: str, dob: str) -> CcisResult:
+        self.searches.append((first_name, last_name))
+        if len(self.searches) == self._error_on:
+            raise RowProblem("odd")
+        pdf = FAKE_PDF + str(len(self.searches)).encode()
+        return CcisResult(pdf, (first_name, last_name) in self._hits)
+
+
 class FakeRunner:
     """Stands in for StacRunner; records what it was asked to file."""
 
@@ -75,13 +94,55 @@ class ProcessRowTests(unittest.TestCase):
         self.assertEqual(written, ["1_DOE_John_NO_RECORD.pdf"])
         self.assertTrue(runner.calls[0][3][0].name.endswith("_NO_RECORD.pdf"))
 
-    def test_compound_surname_no_record_is_still_filed(self):
-        runner = FakeRunner()
-        outcome, _ = self.run_row(
-            FakeCcis(CcisResult(FAKE_PDF, False)), runner, make_row("DOE SMITH")
+    def compound_row(self) -> dict:
+        row = make_row("DOE SMITH")
+        row["last_name"] = "DOE SMITH"
+        row["name"] = "DOE SMITH, John Paul"
+        return row
+
+    def test_compound_name_hit_on_a_part_is_filed_and_stops_searching(self):
+        ccis, runner = ScriptedCcis(hits={("John", "SMITH")}), FakeRunner()
+        outcome, written = self.run_row(ccis, runner, self.compound_row())
+        self.assertEqual(outcome, Outcome.FILED_PARTIAL_NAME)
+        self.assertEqual(
+            ccis.searches, [("John", "DOE SMITH"), ("John", "DOE"), ("John", "SMITH")]
         )
-        self.assertEqual(outcome, Outcome.FILED_NO_RECORD)
         self.assertEqual(len(runner.calls), 1)
+        # Named for the person on the sheet, not for the variant that hit.
+        self.assertEqual(written, ["1_DOE_SMITH_John.pdf"])
+
+    def test_compound_name_hit_on_the_full_name_is_an_ordinary_filing(self):
+        ccis = ScriptedCcis(hits={("John", "DOE SMITH")})
+        outcome, _ = self.run_row(ccis, FakeRunner(), self.compound_row())
+        self.assertEqual(outcome, Outcome.FILED)
+        self.assertEqual(len(ccis.searches), 1)
+
+    def test_compound_name_all_misses_files_the_full_name_page(self):
+        ccis, runner = ScriptedCcis(), FakeRunner()
+        with tempfile.TemporaryDirectory() as folder:
+            outcome = main.process_row(self.compound_row(), ccis, runner, Path(folder))
+            filed = runner.calls[0][3][0].read_bytes()
+        self.assertEqual(outcome, Outcome.FILED_NO_RECORD)
+        self.assertEqual(len(ccis.searches), 6)
+        self.assertEqual(filed, FAKE_PDF + b"1")
+
+    def test_ccis_problem_on_a_later_variant_files_nothing(self):
+        ccis, runner = ScriptedCcis(error_on=2), FakeRunner()
+        outcome, written = self.run_row(ccis, runner, self.compound_row())
+        self.assertEqual(outcome, Outcome.ERROR)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(written, [])
+
+    def test_rehearsal_and_upload_only_outcomes_for_partial_name(self):
+        ccis = ScriptedCcis(hits={("John", "DOE")})
+        outcome, _ = self.run_row(
+            ccis, FakeRunner(upload_enabled=False, save_enabled=False), self.compound_row()
+        )
+        self.assertEqual(outcome, Outcome.REHEARSED_PARTIAL_NAME)
+        outcome, _ = self.run_row(
+            ccis, FakeRunner(upload_enabled=True, save_enabled=False), self.compound_row()
+        )
+        self.assertEqual(outcome, Outcome.REACHED_SAVE_PARTIAL_NAME)
 
     def test_rehearsal_and_upload_only_outcomes_for_no_record(self):
         ccis = FakeCcis(CcisResult(FAKE_PDF, False))

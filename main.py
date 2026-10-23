@@ -52,7 +52,7 @@ import report_reader  # noqa: E402
 from ccis import CcisSession  # noqa: E402
 from config_loader import load_config  # noqa: E402
 from exceptions import ConfigProblem, RowProblem, SystemProblem  # noqa: E402
-from excel_handler import Outcome, Spreadsheet  # noqa: E402
+from excel_handler import Outcome, Spreadsheet, search_variants  # noqa: E402
 from logger import get_logger, setup_logging  # noqa: E402
 from report_fetch import fetch_report  # noqa: E402
 from stac import SaveMayHaveHappened, StacRunner, StacSession  # noqa: E402
@@ -216,21 +216,44 @@ def process_row(row: dict, ccis: CcisSession, runner: StacRunner, pdf_folder: Pa
             _describe(row), row["search_last"], row["last_name"],
         )
 
-    try:
-        result = ccis.fetch_pdf(row["first_name"], row["search_last"], row["dob"])
-    except RowProblem as error:
-        logger.warning("%s: CCIS problem, %s", _describe(row), error)
-        return Outcome.ERROR
+    # venire's insight: a compound name that returns nothing may be indexed
+    # under only part of it. So a miss is retried with the other variants, and
+    # the first hit is the one filed. The fallback only matters for a row
+    # built without a parseable name, which the readers refuse before here.
+    variants = search_variants(row["name"]) or [(row["first_name"], row["search_last"])]
+    first_miss = None
+    for matched_on, (first, last) in enumerate(variants):
+        if matched_on:
+            logger.info(
+                "%s: no CCIS record yet, trying %s, %s (search %d of %d)",
+                _describe(row), last, first, matched_on + 1, len(variants),
+            )
+        try:
+            result = ccis.fetch_pdf(first, last, row["dob"])
+        except RowProblem as error:
+            # Even after earlier misses: "no record" is only filed once every
+            # variant has actually been searched.
+            logger.warning("%s: CCIS problem, %s", _describe(row), error)
+            return Outcome.ERROR
+        if result.has_record:
+            break
+        if first_miss is None:
+            first_miss = result
+    else:
+        # Every variant missed. The full-name page is the one filed, because it
+        # shows the name exactly as the sheet has it.
+        result = first_miss
+        if len(variants) > 1:
+            logger.info(
+                "%s: no CCIS record under any of %d name variants",
+                _describe(row), len(variants),
+            )
 
     has_record = result.has_record
-    if not has_record and len(row["search_last"].split()) >= 2:
-        # venire's insight, kept as a warning: a compound last name that
-        # returns nothing may be indexed under only part of the surname. The
-        # no-results PDF is filed regardless; this is for whoever reviews the log.
-        logger.warning(
-            "%s: no CCIS record, but %r is a compound last name and may be "
-            "indexed under part of it. Filing the no-results PDF anyway.",
-            _describe(row), row["search_last"],
+    if has_record and matched_on:
+        logger.info(
+            "%s: CCIS record found as %s, %s after the full name missed",
+            _describe(row), last, first,
         )
 
     # Selenium uploads from a path, so the bytes have to land on disk.
@@ -259,12 +282,26 @@ def process_row(row: dict, ccis: CcisSession, runner: StacRunner, pdf_folder: Pa
         logger.warning("%s: not filed, %s", _describe(row), error)
         return Outcome.STAC_PROBLEM
 
+    if not has_record:
+        filed, reached_save, rehearsed = (
+            Outcome.FILED_NO_RECORD, Outcome.REACHED_SAVE_NO_RECORD, Outcome.REHEARSED_NO_RECORD,
+        )
+    elif matched_on:
+        filed, reached_save, rehearsed = (
+            Outcome.FILED_PARTIAL_NAME, Outcome.REACHED_SAVE_PARTIAL_NAME,
+            Outcome.REHEARSED_PARTIAL_NAME,
+        )
+    else:
+        filed, reached_save, rehearsed = (
+            Outcome.FILED, Outcome.REACHED_SAVE, Outcome.REHEARSED,
+        )
+
     session = runner.session
     if session.save_enabled:
-        return Outcome.FILED if has_record else Outcome.FILED_NO_RECORD
+        return filed
     if session.upload_enabled:
-        return Outcome.REACHED_SAVE if has_record else Outcome.REACHED_SAVE_NO_RECORD
-    return Outcome.REHEARSED if has_record else Outcome.REHEARSED_NO_RECORD
+        return reached_save
+    return rehearsed
 
 
 def check(config: dict, report: Path | None) -> int:
