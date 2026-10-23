@@ -228,6 +228,9 @@ def process_row(row: dict, ccis: CcisSession, runner: StacRunner, pdf_folder: Pa
                 "%s: no CCIS record yet, trying %s, %s (search %d of %d)",
                 _describe(row), last, first, matched_on + 1, len(variants),
             )
+        # Counted before the search, so one that fails still counts. Read by
+        # _summarise to show whether the extra searches are finding anything.
+        row["ccis_searches"] = matched_on + 1
         try:
             result = ccis.fetch_pdf(first, last, row["dob"])
         except RowProblem as error:
@@ -252,8 +255,8 @@ def process_row(row: dict, ccis: CcisSession, runner: StacRunner, pdf_folder: Pa
     has_record = result.has_record
     if has_record and matched_on:
         logger.info(
-            "%s: CCIS record found as %s, %s after the full name missed",
-            _describe(row), last, first,
+            "%s: CCIS record found as %s, %s on search %d of %d, after the full name missed",
+            _describe(row), last, first, matched_on + 1, len(variants),
         )
 
     # Selenium uploads from a path, so the bytes have to land on disk.
@@ -602,6 +605,22 @@ def _summarise(rows: list, working_copy: Path) -> None:
     logger.info("Rows this pass: %s", len(rows))
     for outcome, count in counts.most_common():
         logger.info("  %-45s %s", outcome, count)
+
+    # Searches past each row's first. Rows that never reached CCIS have no
+    # count, and the first search is the one every row gets anyway.
+    retried = [row for row in rows if row.get("ccis_searches", 0) > 1]
+    if retried:
+        found = sum(
+            1 for row in retried
+            if row["outcome"] in (
+                Outcome.FILED_PARTIAL_NAME, Outcome.REACHED_SAVE_PARTIAL_NAME,
+                Outcome.REHEARSED_PARTIAL_NAME,
+            )
+        )
+        logger.info(
+            "Extra CCIS searches: %s on %s row(s), %s found a record",
+            sum(row["ccis_searches"] - 1 for row in retried), len(retried), found,
+        )
 
     unconfirmed = counts.get(Outcome.CHECK_BY_HAND, 0)
     if unconfirmed:
