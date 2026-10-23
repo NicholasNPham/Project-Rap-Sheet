@@ -36,7 +36,10 @@ from urllib.parse import urlsplit
 
 from selenium import webdriver
 from selenium.common.exceptions import (
+    ElementClickInterceptedException,
     NoAlertPresentException,
+    NoSuchElementException,
+    StaleElementReferenceException,
     TimeoutException,
     WebDriverException,
 )
@@ -1740,6 +1743,10 @@ class StacSession:
                 failure that goes straight to a person.
             SystemProblem: If Save could not be pressed at all, in which case
                 nothing was saved and a retry is safe.
+
+        A browser error around the click is sorted by whether the click had
+        started, as in DALYN: before it, nothing reached STAC; during it,
+        nobody can say, so it goes to a person.
         """
         upload_wait = WebDriverWait(self.driver, self.upload_timeout)
 
@@ -1755,10 +1762,25 @@ class StacSession:
                 f"The Subtype field never showed {self.subtype} before Save."
             ) from error
 
+        # A covered click never reaches the button, so nothing is saved and
+        # trying again is safe.
+        press = PressWhenUncovered(SAVE_BUTTON_ID)
         try:
-            upload_wait.until(EC.element_to_be_clickable((By.ID, SAVE_BUTTON_ID))).click()
+            upload_wait.until(press)
         except TimeoutException as error:
-            raise SystemProblem("Could not press Save.") from error
+            raise SystemProblem(f"Could not press Save: {press.blocker}.") from error
+        except WebDriverException as error:
+            if not press.clicking:
+                raise SystemProblem(
+                    f"The browser failed before Save was clicked: {type(error).__name__}"
+                ) from error
+            # Chrome failed inside the click itself. Whether STAC got it
+            # cannot be told from here, and a retry could file it twice.
+            raise SaveMayHaveHappened(
+                f"The browser failed while clicking Save for {names} on {ucn} "
+                f"({type(error).__name__}). The rap sheet may or may not be on the "
+                "case. Check it by hand; do not re-run this row."
+            ) from error
 
         # Past this line STAC may already have the document.
         try:
@@ -1782,6 +1804,75 @@ class StacSession:
             logger.warning("%s: the saved notification did not clear", ucn)
 
         logger.info("%s: saved %s under %s", ucn, names, self.pair)
+
+
+class PressWhenUncovered:
+    """A WebDriverWait condition that clicks the element once nothing covers it.
+
+    Ported from DALYN. Selenium's "clickable" means shown and enabled, not
+    uncovered. After an upload STAC lays its k-loading-image spinner over the
+    page for a moment, and a click then lands on the spinner and raises. On
+    2026-10-23 live that escaped _save as an unexpected error and stopped the
+    watch. Each try records what stood in the way, in `blocker`, for the
+    error to name. Only a tag and its class or id, never page text, which
+    can carry defendant names.
+    """
+
+    def __init__(self, element_id: str) -> None:
+        """Remember the element to click, for example SAVE_BUTTON_ID."""
+        self.element_id = element_id
+        self.blocker = "nothing tried yet"
+        # True while click() is running, so a caller that sees some other
+        # browser error knows whether the click may have reached the page.
+        # For Save that is the line between a safe retry and a person.
+        self.clicking = False
+
+    def __call__(self, driver: object) -> bool:
+        """Try the click once. True once it went through, False to keep waiting."""
+        self.clicking = False
+        try:
+            element = driver.find_element(By.ID, self.element_id)
+            if not element.is_displayed():
+                self.blocker = "the button is hidden"
+                return False
+            if not element.is_enabled():
+                self.blocker = "the button is disabled"
+                return False
+            self.clicking = True
+            element.click()
+        except NoSuchElementException:
+            self.blocker = "the button is not on the page"
+            return False
+        except StaleElementReferenceException:
+            # Chrome refused the click on a redrawn button, so it never landed.
+            self.clicking = False
+            self.blocker = "the page was redrawing"
+            return False
+        except ElementClickInterceptedException as error:
+            self.clicking = False
+            self.blocker = f"covered by {describe_intercepting_element(error.msg or '')}"
+            return False
+        return True
+
+
+def describe_intercepting_element(message: str) -> str:
+    """Name the element Chrome says took the click, as tag.class or tag#id.
+
+    Chrome's message ends "Other element would receive the click: <div
+    class="k-loading-image"></div>". Only the tag and its class or id are
+    kept, so no text from the page reaches the log.
+    """
+    match = re.search(r"would receive the click: <(\w+)([^>]*)>", message)
+    if not match:
+        return "another element"
+    tag, attributes = match.groups()
+    found = re.search(r'\bclass="([^"]*)"', attributes)
+    if found and found.group(1).strip():
+        return f"{tag}.{'.'.join(found.group(1).split())}"
+    found = re.search(r'\bid="([^"]*)"', attributes)
+    if found and found.group(1):
+        return f"{tag}#{found.group(1)}"
+    return tag
 
 
 def _name_tokens(name: str) -> set[str]:
