@@ -126,7 +126,38 @@ CASE_PAGE_DEFENDANT_CSS = (
 # Add image: dropzone and tiles
 IMAGE_TILE_UNSELECTED_CSS = "#image-manager-listview-name .cipimage:not(.k-selected)"
 DROPZONE_PANEL_CSS = ".pagesImagesIndex-upload-drop-zone-element"
-PREVIEW_IFRAME_CSS = "#imageTabPageSplitterRightPane iframe.iframe-document"
+PREVIEW_PANE_CSS = "#imageTabPageSplitterRightPane"
+PREVIEW_IFRAME_CSS = f"{PREVIEW_PANE_CSS} iframe.iframe-document"
+
+# Kendo's loading spinner. On 2026-10-26 live one covered Save for the whole
+# upload_timeout, and every row that failed that way had a preview loaded
+# before the upload. _upload removes the preview iframe, and DALYN found the
+# preview's own mask then stays up waiting for it. Whether that mask is the
+# one over Save here is what DESCRIBE_SPINNERS_JS is logged to find out.
+SPINNER_CSS = ".k-loading-image"
+
+# Where each shown spinner sits, for the log when Save stays covered: its
+# parents by tag, id and class, whether it is inside the preview pane, and
+# whether it overlaps Save. Markup only, never page text. The arguments are
+# copied out first: inside the map callback, `arguments` is the callback's own.
+DESCRIBE_SPINNERS_JS = """
+var spinnerCss = arguments[0], saveId = arguments[1], paneCss = arguments[2];
+var save = document.getElementById(saveId);
+var s = save ? save.getBoundingClientRect() : null;
+return Array.from(document.querySelectorAll(spinnerCss))
+  .filter(function (e) { return e.getClientRects().length > 0; })
+  .map(function (e) {
+    var chain = [], n = e.parentElement;
+    while (n && chain.length < 5) {
+      chain.push(n.tagName.toLowerCase() + (n.id ? '#' + n.id : '')
+        + (n.classList.length ? '.' + Array.from(n.classList).slice(0, 2).join('.') : ''));
+      n = n.parentElement;
+    }
+    var r = e.getBoundingClientRect();
+    var covers = !!s && r.left < s.right && r.right > s.left && r.top < s.bottom && r.bottom > s.top;
+    return {chain: chain.join(' < '), preview: !!e.closest(paneCss), covers_save: covers};
+  });
+"""
 FILE_INPUT_CSS = (
     "input[id^='cipFileUpload_pagesImagesIndex-upload'][multiple]:not([webkitdirectory])"
 )
@@ -1313,6 +1344,34 @@ class StacSession:
             f"var f=document.querySelector({PREVIEW_IFRAME_CSS!r}); if(f) f.remove();"
         )
 
+    def _describe_spinners(self) -> str:
+        """Say where each shown spinner sits, for the log.
+
+        Digits are masked, since an element id can carry a record number.
+
+        Returns:
+            One bracketed entry per shown spinner, or a short note when none
+            shows or the page could not be read.
+
+        Raises:
+            Nothing. It runs while another error is already on its way up,
+            and must not replace that error.
+        """
+        try:
+            spinners = self.driver.execute_script(
+                DESCRIBE_SPINNERS_JS, SPINNER_CSS, SAVE_BUTTON_ID, PREVIEW_PANE_CSS
+            )
+        except WebDriverException as error:
+            return f"could not describe them ({type(error).__name__})"
+        if not spinners:
+            return "none shown any more"
+        return "; ".join(
+            f"[{'in the preview pane' if s['preview'] else 'outside the preview pane'}, "
+            f"{'covers Save' if s['covers_save'] else 'clear of Save'}] "
+            f"{re.sub(r'[0-9]+', '#', s['chain'])}"
+            for s in spinners
+        )
+
     def _select_type_subtype(self) -> None:
         """Open the matrix dialog, select the run's Type/Subtype row, and verify.
 
@@ -1768,6 +1827,7 @@ class StacSession:
         try:
             upload_wait.until(press)
         except TimeoutException as error:
+            logger.warning("%s: Save still covered; spinners: %s", ucn, self._describe_spinners())
             raise SystemProblem(f"Could not press Save: {press.blocker}.") from error
         except WebDriverException as error:
             if not press.clicking:
