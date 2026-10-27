@@ -1,5 +1,6 @@
 """Unit tests for report_fetch's download watching. No browser, made-up files only."""
 
+import os
 import sys
 import tempfile
 import threading
@@ -56,6 +57,31 @@ class DownloadWatchTests(unittest.TestCase):
         (self.folder / "AutoCCIS (1).xls").write_bytes(b"")
         with self.assertRaises(SystemProblem):
             rf._wait_for_finish(self.folder, self.before, 1.5)
+
+    def _write_over_old_export(self) -> Path:
+        """Write over the earlier run's AutoCCIS.xls, as Chrome does, and return it.
+
+        The modified time is moved on explicitly so the test does not depend
+        on the filesystem's clock resolution.
+        """
+        old = self.folder / "AutoCCIS.xls"
+        old.write_bytes(b"made-up export")
+        later = self.before["AutoCCIS.xls"] + 1_000_000_000
+        os.utime(old, ns=(later, later))
+        return old
+
+    def test_export_written_over_old_file_counts_as_new(self):
+        self._write_over_old_export()
+        self.assertEqual(
+            [path.name for path in rf._new_files(self.folder, self.before)],
+            ["AutoCCIS.xls"],
+        )
+        self.assertTrue(rf._wait_for_start(self.folder, self.before, 0.2))
+
+    def test_export_written_over_old_file_is_returned(self):
+        self._write_over_old_export()
+        found = rf._wait_for_finish(self.folder, self.before, 3)
+        self.assertEqual(found.name, "AutoCCIS.xls")
 
 
 if __name__ == "__main__":

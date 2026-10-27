@@ -257,7 +257,7 @@ def fetch_report(
             arrived.name, REPORT_NAME,
         )
         _log_chrome_downloads(driver)
-        before.add(arrived.name)
+        before[arrived.name] = arrived.stat().st_mtime_ns
 
     if downloaded is None:
         raise SystemProblem(
@@ -522,20 +522,38 @@ def _log_chrome_downloads(driver) -> None:
             logger.warning("Could not get back to the report tab: %s", error)
 
 
-def _files_in(folder: Path) -> set[str]:
-    """Names of the files in `folder` right now."""
-    return {path.name for path in folder.iterdir() if path.is_file()}
+def _files_in(folder: Path) -> dict[str, int]:
+    """Each file in `folder` right now, with its last-modified time in nanoseconds.
+
+    A file that disappears between being listed and being looked at is left
+    out. Chrome renaming its partial file to the finished name looks like
+    that, and the next look sees the finished file.
+    """
+    times = {}
+    for path in folder.iterdir():
+        try:
+            if path.is_file():
+                times[path.name] = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            continue
+    return times
 
 
-def _new_files(folder: Path, before: set[str]) -> list[Path]:
-    """Files in `folder` that were not there before, partial downloads included."""
+def _new_files(folder: Path, before: dict[str, int]) -> list[Path]:
+    """Files in `folder` that are new or written since `before`, partials included.
+
+    Written since counts as well as new because Chrome, told where to save,
+    writes over a file of the same name. An AutoCCIS.xls left behind by an
+    earlier run that never renamed it would otherwise hide every later
+    download under a name that was already there.
+    """
     return [
-        path for path in folder.iterdir()
-        if path.is_file() and path.name not in before
+        folder / name for name, modified in _files_in(folder).items()
+        if before.get(name) != modified
     ]
 
 
-def _wait_for_start(folder: Path, before: set[str], seconds: float) -> bool:
+def _wait_for_start(folder: Path, before: dict[str, int], seconds: float) -> bool:
     """True once any new file, finished or not, shows up in `folder`."""
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
@@ -570,7 +588,7 @@ def _rename(source: Path, target: Path) -> None:
             raise SystemProblem(f"Could not rename the export {source.name}: {error}") from error
 
 
-def _wait_for_finish(folder: Path, before: set[str], seconds: float) -> Path:
+def _wait_for_finish(folder: Path, before: dict[str, int], seconds: float) -> Path:
     """Wait for the new download to finish, and return it.
 
     Finished means no partial file is left and the new file's size has held
