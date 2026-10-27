@@ -139,13 +139,17 @@ CHROME_DOWNLOADS_URL = "chrome://downloads"
 # to leave out, so the download's URL, which carries session tokens, can never
 # slip into the log.
 CHROME_DOWNLOAD_FIELDS = (
-    "fileName", "state", "dangerType", "lastReasonText",
+    "fileName", "filePath", "state", "dangerType", "lastReasonText",
     "percent", "progressStatusText", "isDangerous", "isInsecure",
 )
 
-# Reads those fields, plus the status line each row shows ("Canceled",
-# "Failed - Network error"), from the page's shadow DOM. null until the page
-# has drawn its list.
+# Reads those fields, plus what each row shows a person: its status tag
+# ("Canceled", "Failed - Network error"), its description line, and the
+# buttons it offers. The buttons say what Chrome is waiting on better than
+# its state number, which changes meaning between Chrome versions: Pause and
+# Cancel for a download under way, Keep and Discard for one held for a
+# decision. The row's URL element is never read. null until the page has
+# drawn its list.
 CHROME_DOWNLOADS_JS = r"""
 var fields = arguments[0];
 var manager = document.querySelector('downloads-manager');
@@ -164,6 +168,16 @@ for (var i = 0; i < rows.length; i++) {
   var root = rows[i].shadowRoot;
   var tag = root ? root.querySelector('#tag') : null;
   entry.status = tag ? tag.textContent.trim() : '';
+  var description = root ? root.querySelector('#description') : null;
+  entry.description = description ? description.textContent.trim() : '';
+  var labels = [];
+  var buttons = root ? root.querySelectorAll('cr-button, button, cr-icon-button') : [];
+  for (var b = 0; b < buttons.length; b++) {
+    if (buttons[b].offsetParent === null) { continue; }
+    var label = (buttons[b].getAttribute('aria-label') || buttons[b].textContent || '').trim();
+    if (label) { labels.push(label); }
+  }
+  entry.buttons = labels.join(' | ');
   out.push(entry);
 }
 return out;
