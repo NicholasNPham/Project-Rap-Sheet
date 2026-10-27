@@ -11,11 +11,14 @@ while before the report appears in it. Clicking export in that gap makes STAC
 build the whole report before it sends anything, so the wait is on the viewer
 having filled in, not on the button or a fixed sleep.
 
-Chrome is told, through the DevTools protocol, to download into a folder this
-run chooses, so the file never has to be fished out of the user's Downloads.
-Chrome names it AutoCCIS.xls, or AutoCCIS (1).xls and so on when that name is
-taken, so the file is found by being new, not by its name, then renamed with
-the date and time so each run's export is kept and none overwrites another.
+Chrome is told, through the DevTools protocol, to download into an incoming
+folder inside the reports folder, so the file never has to be fished out of
+the user's Downloads. Chrome names it AutoCCIS.xls and writes over a file of
+that name, so a raw export left behind by a failed run once hid every later
+one. The incoming folder is emptied before the export is clicked, which
+leaves the download as the only thing that can arrive there. It is then
+renamed with the date and time and moved up into the reports folder, so each
+run's export is kept and none overwrites another.
 
 The browser stays on the report page afterwards. Each case opens in a tab of
 its own, so nothing needs the main tab to be anywhere in particular.
@@ -130,6 +133,10 @@ PARTIAL_SUFFIXES = (".crdownload", ".tmp", ".part")
 # renamed copy and to warn if some other report came down instead.
 REPORT_NAME = "AutoCCIS"
 
+# The subfolder of the reports folder Chrome downloads into. Only raw,
+# unrenamed downloads ever sit here, so emptying it loses nothing a pass used.
+INCOMING_FOLDER_NAME = "incoming"
+
 # Chrome's own downloads page. When an export attempt fails it is read in a
 # tab of its own, because a download Chrome cancels or blocks has its file
 # deleted, leaving nothing in the folder to say why.
@@ -199,7 +206,8 @@ def fetch_report(
 
     Args:
         session: A signed-in StacSession, on its main tab.
-        download_dir: Where the export is saved. Created if missing.
+        download_dir: Where the export is saved. Created if missing, along
+            with the incoming folder inside it that Chrome downloads into.
         report_timeout: Seconds to wait for the report to finish loading.
         download_timeout: Seconds to wait for the download to finish once it
             has started.
@@ -214,8 +222,9 @@ def fetch_report(
             nothing to work on, so the run stops.
     """
     download_dir = Path(download_dir).resolve()
-    download_dir.mkdir(parents=True, exist_ok=True)
-    _send_downloads_to(session, download_dir)
+    incoming = download_dir / INCOMING_FOLDER_NAME
+    incoming.mkdir(parents=True, exist_ok=True)
+    _send_downloads_to(session, incoming)
 
     driver = session.driver
     wait = WebDriverWait(driver, session.wait_timeout)
@@ -226,14 +235,17 @@ def fetch_report(
     _start_search(wait, driver)
     logger.info("Report search started, waiting for it to load")
 
-    before = _files_in(download_dir)
+    # Emptied once, not before every try: a download from an earlier try that
+    # arrives late is still this pass's report.
+    _empty_incoming(incoming)
+    before = _files_in(incoming)
     downloaded = None
     for attempt in range(1, EXPORT_CLICK_ATTEMPTS + 1):
         button = _wait_for_export(driver, report_timeout)
         driver.execute_script("arguments[0].click();", button)
         logger.info("Clicked Excel export (try %s of %s)", attempt, EXPORT_CLICK_ATTEMPTS)
 
-        if not _wait_for_start(download_dir, before, DOWNLOAD_START_SECONDS):
+        if not _wait_for_start(incoming, before, DOWNLOAD_START_SECONDS):
             logger.warning(
                 "No download started within %ss of clicking export", DOWNLOAD_START_SECONDS
             )
@@ -241,7 +253,7 @@ def fetch_report(
             continue
 
         try:
-            arrived = _wait_for_finish(download_dir, before, download_timeout)
+            arrived = _wait_for_finish(incoming, before, download_timeout)
         except SystemProblem:
             _log_chrome_downloads(driver)
             raise
@@ -251,7 +263,8 @@ def fetch_report(
 
         # Chrome names an HTML response with no filename downloads.htm. That
         # is STAC answering the export with a page, not the report. It is left
-        # in the folder, ignored from here on, and the export clicked again.
+        # in the incoming folder, ignored from here on, and the export clicked
+        # again. The next pass empties it.
         logger.warning(
             "The export came back as %r, not %s. Clicking export again.",
             arrived.name, REPORT_NAME,
@@ -262,7 +275,7 @@ def fetch_report(
     if downloaded is None:
         raise SystemProblem(
             f"Clicked the Excel export {EXPORT_CLICK_ATTEMPTS} times and no "
-            f"{REPORT_NAME} file arrived in {download_dir}."
+            f"{REPORT_NAME} file arrived in {incoming}."
         )
 
     final = download_dir / (
@@ -520,6 +533,31 @@ def _log_chrome_downloads(driver) -> None:
             driver.switch_to.window(home)
         except WebDriverException as error:
             logger.warning("Could not get back to the report tab: %s", error)
+
+
+def _empty_incoming(folder: Path) -> None:
+    """Delete every file an earlier run left in the incoming folder. Never raises.
+
+    Anything here is a raw download a failed pass never renamed or used: a
+    late copy of a report, or STAC's downloads.htm. Each one removed is
+    logged by name. One that cannot be removed, because something still has
+    it open, is logged and left: the download wait already tells a file
+    written after the click from one that was there before, so it cannot be
+    mistaken for this pass's export.
+
+    Args:
+        folder: The incoming folder.
+    """
+    for path in folder.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            path.unlink()
+            logger.warning("Removed %s left in %s by an earlier run", path.name, folder.name)
+        except OSError as error:
+            logger.warning(
+                "Could not remove %s from %s, leaving it: %s", path.name, folder.name, error
+            )
 
 
 def _files_in(folder: Path) -> dict[str, int]:

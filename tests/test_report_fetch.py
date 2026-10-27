@@ -84,5 +84,29 @@ class DownloadWatchTests(unittest.TestCase):
         self.assertEqual(found.name, "AutoCCIS.xls")
 
 
+class EmptyIncomingTests(unittest.TestCase):
+    def setUp(self):
+        self._folder = tempfile.TemporaryDirectory()
+        self.folder = Path(self._folder.name)
+
+    def tearDown(self):
+        self._folder.cleanup()
+
+    def test_removes_leftover_downloads(self):
+        (self.folder / "AutoCCIS.xls").write_bytes(b"made-up export")
+        (self.folder / "downloads.htm").write_bytes(b"<html></html>")
+        rf._empty_incoming(self.folder)
+        self.assertEqual(list(self.folder.iterdir()), [])
+
+    def test_leaves_subfolders_alone(self):
+        (self.folder / "kept").mkdir()
+        rf._empty_incoming(self.folder)
+        self.assertTrue((self.folder / "kept").is_dir())
+
+    def test_empty_folder_is_fine(self):
+        rf._empty_incoming(self.folder)
+        self.assertEqual(list(self.folder.iterdir()), [])
+
+
 if __name__ == "__main__":
     unittest.main()
