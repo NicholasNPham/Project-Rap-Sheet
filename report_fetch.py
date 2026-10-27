@@ -130,6 +130,50 @@ PARTIAL_SUFFIXES = (".crdownload", ".tmp", ".part")
 # renamed copy and to warn if some other report came down instead.
 REPORT_NAME = "AutoCCIS"
 
+# Chrome's own downloads page. When an export attempt fails it is read in a
+# tab of its own, because a download Chrome cancels or blocks has its file
+# deleted, leaving nothing in the folder to say why.
+CHROME_DOWNLOADS_URL = "chrome://downloads"
+
+# Fields of each download worth logging. A list of names to take, not a list
+# to leave out, so the download's URL, which carries session tokens, can never
+# slip into the log.
+CHROME_DOWNLOAD_FIELDS = (
+    "fileName", "state", "dangerType", "lastReasonText",
+    "percent", "progressStatusText", "isDangerous", "isInsecure",
+)
+
+# Reads those fields, plus the status line each row shows ("Canceled",
+# "Failed - Network error"), from the page's shadow DOM. null until the page
+# has drawn its list.
+CHROME_DOWNLOADS_JS = r"""
+var fields = arguments[0];
+var manager = document.querySelector('downloads-manager');
+if (!manager || !manager.shadowRoot) { return null; }
+var rows = manager.shadowRoot.querySelectorAll('downloads-item');
+var out = [];
+for (var i = 0; i < rows.length; i++) {
+  var data = rows[i].data || {};
+  var entry = {};
+  for (var f = 0; f < fields.length; f++) {
+    var value = data[fields[f]];
+    if (value !== undefined && value !== null && typeof value !== 'object') {
+      entry[fields[f]] = String(value);
+    }
+  }
+  var root = rows[i].shadowRoot;
+  var tag = root ? root.querySelector('#tag') : null;
+  entry.status = tag ? tag.textContent.trim() : '';
+  out.push(entry);
+}
+return out;
+"""
+
+# Seconds to give the downloads page to list its rows. The list fills in a
+# moment after the page loads, and an empty list is a real answer, so this
+# is how long an empty list is waited on before being believed.
+CHROME_DOWNLOADS_SECONDS = 5
+
 
 def fetch_report(
     session: StacSession,
@@ -179,9 +223,14 @@ def fetch_report(
             logger.warning(
                 "No download started within %ss of clicking export", DOWNLOAD_START_SECONDS
             )
+            _log_chrome_downloads(driver)
             continue
 
-        arrived = _wait_for_finish(download_dir, before, download_timeout)
+        try:
+            arrived = _wait_for_finish(download_dir, before, download_timeout)
+        except SystemProblem:
+            _log_chrome_downloads(driver)
+            raise
         if REPORT_NAME.lower() in arrived.name.lower():
             downloaded = arrived
             break
@@ -193,6 +242,7 @@ def fetch_report(
             "The export came back as %r, not %s. Clicking export again.",
             arrived.name, REPORT_NAME,
         )
+        _log_chrome_downloads(driver)
         before.add(arrived.name)
 
     if downloaded is None:
@@ -406,6 +456,56 @@ def _wait_for_export(driver, timeout: int) -> WebElement:
             f"The report preview did not fill in within {timeout}s, or its "
             "Excel export button never became usable."
         ) from error
+
+
+def _log_chrome_downloads(driver) -> None:
+    """Log what Chrome's downloads page says about each download. Never raises.
+
+    Opens chrome://downloads in a new tab, logs one line per download, then
+    closes the tab and goes back to the tab it started on. Only the fields in
+    CHROME_DOWNLOAD_FIELDS and the row's status line are logged, never the
+    URL. A diagnostic, so any failure here is logged and swallowed rather
+    than ending a pass that might still succeed on the next click.
+
+    Args:
+        driver: The report STAC's WebDriver, on the report tab.
+    """
+    try:
+        home = driver.current_window_handle
+    except WebDriverException as error:
+        logger.warning("Could not read Chrome's downloads page: %s", error)
+        return
+
+    try:
+        driver.switch_to.new_window("tab")
+        driver.get(CHROME_DOWNLOADS_URL)
+        rows = None
+        deadline = time.monotonic() + CHROME_DOWNLOADS_SECONDS
+        while time.monotonic() < deadline:
+            rows = driver.execute_script(CHROME_DOWNLOADS_JS, list(CHROME_DOWNLOAD_FIELDS))
+            if rows:
+                break
+            time.sleep(POLL_SECONDS)
+
+        if rows is None:
+            logger.warning("Chrome's downloads page never drew its list")
+        elif not rows:
+            logger.warning("Chrome's downloads page lists no downloads at all")
+        else:
+            for number, row in enumerate(rows, start=1):
+                logger.warning(
+                    "Chrome download %s of %s: %s",
+                    number, len(rows), ", ".join(f"{k}={v!r}" for k, v in row.items()),
+                )
+    except WebDriverException as error:
+        logger.warning("Could not read Chrome's downloads page: %s", error)
+    finally:
+        try:
+            if driver.current_window_handle != home:
+                driver.close()
+            driver.switch_to.window(home)
+        except WebDriverException as error:
+            logger.warning("Could not get back to the report tab: %s", error)
 
 
 def _files_in(folder: Path) -> set[str]:
