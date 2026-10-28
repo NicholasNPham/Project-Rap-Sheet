@@ -132,6 +132,21 @@ class BuildRowsTests(unittest.TestCase):
         self.assertIn("date of birth", problems[3])
         self.assertIn("no UCN", problems[4])
 
+    def test_problems_never_quote_the_name_or_date(self):
+        # Problems are logged, and the log never carries names or dates of
+        # birth. The unreadable date matters most: the redactor cannot catch
+        # it, because it never became a date of birth to register.
+        rows = build(export(
+            (UCN, LINK, "DOE, JR, John", "01/01/1980"),
+            (UCN, LINK, "John Doe", "01/01/1980"),
+            (UCN, LINK, "DOE, John", "1980-13-01"),
+        ))
+        for row in rows:
+            text = row["problem"].upper()
+            self.assertTrue(text)
+            for value in ("DOE", "JOHN", "1980"):
+                self.assertNotIn(value, text)
+
     def test_blank_rows_are_skipped_and_numbering_stays_dense(self):
         rows = export((UCN, LINK, "DOE, John", "01/01/1980"))
         rows.append([("", "")] * 6)

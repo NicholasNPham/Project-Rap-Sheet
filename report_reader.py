@@ -258,21 +258,27 @@ def build_rows(rows: list[list[Cell]], header_at: int, columns: dict[str, int]) 
         dob = normalise_dob(dob_value)
         ucn = normalise_ucn(ucn_value)
 
+        # These go to the log, so they describe what is wrong without quoting
+        # the name or date of birth. The row number in the log line is how
+        # to find the row and see the value itself. An unreadable date is
+        # the one value the log redactor cannot catch, since it never became
+        # a date of birth to register.
         problem = ""
         if not name:
             problem = "no name in this row"
         elif name.count(COMMA_DELIMITER) > MAX_SPLIT_PARAMETER:
             problem = (
-                f"{name!r} has more than one comma, so which part is the surname is "
+                "the name has more than one comma, so which part is the surname is "
                 "ambiguous. Searching CCIS for the wrong first name would come back "
                 "as a clean 'no record'."
             )
         elif not first_name or not last_name:
-            problem = f"could not split {name!r} into a first and last name"
+            problem = "could not split the name into a first and last name"
         elif not dob:
             problem = (
-                f"could not read the date of birth {_text(dob_value)!r}; it needs "
-                "to be yyyy-mm-dd or mm-dd-yyyy"
+                "could not read the date of birth"
+                + ("" if _text(dob_value) else " (the cell is blank)")
+                + "; it needs to be yyyy-mm-dd or mm-dd-yyyy"
             )
         elif not ucn:
             problem = "no UCN in this row"
