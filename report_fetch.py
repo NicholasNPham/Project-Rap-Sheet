@@ -28,7 +28,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import (
+    InvalidSessionIdException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
@@ -114,11 +118,19 @@ LOADING_CSS = ".k-loading-mask, .k-loading-image, .k-loader, .k-i-loading"
 DEFAULT_REPORT_TIMEOUT = 180
 DEFAULT_DOWNLOAD_TIMEOUT = 300
 
-# Seconds to wait for a download to begin after clicking export. If nothing
-# appears in that time the click most likely landed before the report was
-# ready, and it is tried once more.
-DOWNLOAD_START_SECONDS = 20
-EXPORT_CLICK_ATTEMPTS = 3
+# Seconds to wait for a download to begin after clicking export, and how many
+# clicks in all. Usually the file starts within 15s, but when STAC is slow
+# (the preview itself taking a minute or more to fill in) it has taken over
+# 70s to start answering the click. On 2026-10-27 at 16:30 a 20s wait clicked
+# three times, and the first click's report arrived seconds after the last
+# wait gave up. Each extra click also makes a slow STAC build the report
+# again, so this waits long and clicks rarely.
+DOWNLOAD_START_SECONDS = 120
+EXPORT_CLICK_ATTEMPTS = 2
+
+# Why the pass stops when Chrome has closed under it. Seen twice on
+# 2026-10-28 with nobody touching the window.
+BROWSER_GONE = "STAC's Chrome closed while the report was being fetched."
 
 # Seconds to keep retrying the rename while Chrome still holds the file.
 RENAME_SECONDS = 10
@@ -242,14 +254,23 @@ def fetch_report(
     downloaded = None
     for attempt in range(1, EXPORT_CLICK_ATTEMPTS + 1):
         button = _wait_for_export(driver, report_timeout)
-        driver.execute_script("arguments[0].click();", button)
+        try:
+            driver.execute_script("arguments[0].click();", button)
+        except InvalidSessionIdException as error:
+            raise SystemProblem(BROWSER_GONE) from error
+        except WebDriverException as error:
+            raise SystemProblem(f"Could not click the Excel export: {error}") from error
         logger.info("Clicked Excel export (try %s of %s)", attempt, EXPORT_CLICK_ATTEMPTS)
 
         if not _wait_for_start(incoming, before, DOWNLOAD_START_SECONDS):
             logger.warning(
                 "No download started within %ss of clicking export", DOWNLOAD_START_SECONDS
             )
-            _log_chrome_downloads(driver)
+            # Only after the last click. Chrome closed twice on 2026-10-28
+            # while this had its downloads page open, so it is kept to the
+            # one look that can still explain a failed pass.
+            if attempt == EXPORT_CLICK_ATTEMPTS:
+                _log_chrome_downloads(driver)
             continue
 
         try:
@@ -425,9 +446,14 @@ def _viewer_text_length(driver) -> int:
 
     Returns:
         The length of the viewer's text, or 0.
+
+    Raises:
+        SystemProblem: The browser is gone. Every later look would fail the
+            same way, so waiting out the timeout would only delay the pass
+            stopping.
     """
-    driver.switch_to.default_content()
     try:
+        driver.switch_to.default_content()
         frames = driver.find_elements(By.CSS_SELECTOR, VIEWER_FRAME_CSS)
         if not frames:
             return 0
@@ -437,12 +463,19 @@ def _viewer_text_length(driver) -> int:
         if any(el.is_displayed() for el in driver.find_elements(By.CSS_SELECTOR, LOADING_CSS)):
             return 0
         return int(driver.execute_script(VIEWER_TEXT_LENGTH_JS) or 0)
+    except InvalidSessionIdException as error:
+        raise SystemProblem(BROWSER_GONE) from error
     except WebDriverException:
         # The frame reloading under us looks like this. Not ready yet; the
         # next look tries again.
         return 0
     finally:
-        driver.switch_to.default_content()
+        try:
+            driver.switch_to.default_content()
+        except WebDriverException:
+            # Already reported above if the browser is gone; otherwise the
+            # next look starts with the same switch and tries again.
+            pass
 
 
 def _find_export(driver) -> WebElement | None:

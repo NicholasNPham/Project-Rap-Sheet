@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import report_fetch as rf  # noqa: E402
+from selenium.common.exceptions import InvalidSessionIdException  # noqa: E402
 from exceptions import SystemProblem  # noqa: E402
 
 
@@ -82,6 +83,25 @@ class DownloadWatchTests(unittest.TestCase):
         self._write_over_old_export()
         found = rf._wait_for_finish(self.folder, self.before, 3)
         self.assertEqual(found.name, "AutoCCIS.xls")
+
+
+class _ClosedSwitchTo:
+    """switch_to for a browser that has closed: every switch fails."""
+
+    def default_content(self) -> None:
+        raise InvalidSessionIdException("browser has closed the connection")
+
+
+class _ClosedDriver:
+    """A WebDriver stand-in whose browser has closed under it."""
+
+    switch_to = _ClosedSwitchTo()
+
+
+class BrowserGoneTests(unittest.TestCase):
+    def test_closed_browser_stops_the_wait_as_a_system_problem(self):
+        with self.assertRaises(SystemProblem):
+            rf._viewer_text_length(_ClosedDriver())
 
 
 class EmptyIncomingTests(unittest.TestCase):
