@@ -52,7 +52,7 @@ from selenium.webdriver.support.ui import Select, WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
 from exceptions import RowProblem, SystemProblem
-from logger import get_logger
+from logger import get_logger, hide_names
 
 logger = get_logger(__name__)
 
@@ -1016,6 +1016,11 @@ class StacSession:
         Raises:
             RowProblem: If both names are readable and they do not match.
         """
+        # STAC's spelling can differ from the report's, and on a mismatch it
+        # is another person's name entirely, so it is hidden from the logs
+        # before anything below can mention it.
+        hide_names([stac_name, expected_name])
+
         if not self.check_name:
             logger.warning(
                 "%s: name check is switched off in config, filing without it", ucn
@@ -1035,24 +1040,23 @@ class StacSession:
 
         if len(_name_tokens(expected_name)) < MIN_NAME_TOKENS:
             raise RowProblem(
-                f"The name {expected_name!r} in the row for {ucn} is only one usable "
-                "word, which matches too many defendants to be a real check."
+                f"The name in the row for {ucn} is only one usable word, which "
+                "matches too many defendants to be a real check."
             )
 
         if names_match(stac_name, expected_name):
-            logger.info(
-                "%s: defendant matches, STAC %r / sheet %r", ucn, stac_name, expected_name
-            )
+            logger.info("%s: defendant matches", ucn)
             return
 
-        # Both names are in the message because without them nobody can tell a
-        # real mismatch from a formatting difference. They are already in the
-        # log by way of the PDF filenames, so this is not new exposure.
+        # Word counts rather than the names, which stay out of the logs. They
+        # still tell a formatting difference (most words matched) from a
+        # different person (none did); the case itself shows both names.
+        stac_words = _name_tokens(stac_name)
+        row_words = _name_tokens(expected_name)
         raise RowProblem(
-            f"Defendant mismatch on {ucn}: STAC says {stac_name!r}, the spreadsheet "
-            f"row says {expected_name!r}. Comparing words "
-            f"{sorted(_name_tokens(stac_name))} against "
-            f"{sorted(_name_tokens(expected_name))}."
+            f"Defendant mismatch on {ucn}: STAC's name has {len(stac_words)} word(s), "
+            f"the report row's has {len(row_words)}, and {len(stac_words & row_words)} "
+            "are the same. Open the case to compare the two names."
         )
 
     # ------------------------------------------------------ case from a link
@@ -1183,7 +1187,9 @@ class StacSession:
             SaveMayHaveHappened: Save was clicked and never confirmed.
             SystemProblem: Anything else in STAC misbehaved.
         """
-        names = ", ".join(Path(path).name for path in paths)
+        # How the files are named in log lines and errors. A count, not the
+        # filenames, which carry the defendant's name.
+        names = f"{len(paths)} PDF" if len(paths) == 1 else f"{len(paths)} PDFs"
 
         if not self.upload_enabled:
             logger.info(
@@ -1975,9 +1981,7 @@ def names_match(stac_name: str, sheet_name: str) -> bool:
     # other. Going the other way would let a one-word name match anything.
     fewer, more = sorted((stac_tokens, sheet_tokens), key=len)
     if _every_word_has_a_near_match(fewer, more):
-        logger.info(
-            "Names matched allowing for spelling: %r and %r", stac_name, sheet_name
-        )
+        logger.info("Names matched allowing for spelling differences")
         return True
 
     return False

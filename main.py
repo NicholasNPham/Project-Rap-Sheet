@@ -53,7 +53,7 @@ from ccis import CcisSession  # noqa: E402
 from config_loader import load_config  # noqa: E402
 from exceptions import ConfigProblem, RowProblem, SystemProblem  # noqa: E402
 from excel_handler import Outcome, Spreadsheet, search_variants  # noqa: E402
-from logger import get_logger, setup_logging  # noqa: E402
+from logger import get_logger, hide_names, hide_values, setup_logging  # noqa: E402
 from report_fetch import fetch_report  # noqa: E402
 from stac import SaveMayHaveHappened, StacRunner, StacSession  # noqa: E402
 
@@ -138,9 +138,46 @@ def pdf_path_for(folder: Path, row: dict, has_record: bool = True) -> Path:
 
 
 def _describe(row: dict) -> str:
-    """How a row is named in the log: enough to find it, nothing extra."""
+    """How a row is named in the log: its row number and UCN, never the person's name."""
     identifier = row["ucn"] or row["case_number"] or "no case number"
-    return f"row {row['row']} ({row['last_name']}, {row['first_name']} / {identifier})"
+    return f"row {row['row']} ({identifier})"
+
+
+def _dob_forms(dob: str | None) -> list[str]:
+    """Every way a row's date of birth may be written in a log line.
+
+    Args:
+        dob: As report_reader leaves it, mm/dd/yyyy, or None.
+
+    Returns:
+        mm/dd/yyyy, yyyy-mm-dd and mm-dd-yyyy, or just `dob` if it is not in
+        the expected shape, or nothing if it is empty.
+    """
+    if not dob:
+        return []
+    try:
+        month, day, year = dob.split("/")
+    except ValueError:
+        return [dob]
+    return [dob, f"{year}-{month}-{day}", f"{month}-{day}-{year}"]
+
+
+def _hide_from_logs(rows: list[dict]) -> None:
+    """Register every row's names and date of birth so the logs never show them.
+
+    Done as soon as the export is read, before any line about a row is
+    written. The log lines themselves name rows by row number and UCN; this
+    is the backstop for error messages, filenames and anything else that
+    carries a name without being asked to.
+
+    Args:
+        rows: Row dicts from report_reader.
+    """
+    hide_names(
+        part for row in rows
+        for part in (row["name"], row["first_name"], row["last_name"], row["search_last"])
+    )
+    hide_values(form for row in rows for form in _dob_forms(row["dob"]))
 
 
 def report_session_config(config: dict) -> dict:
@@ -211,10 +248,7 @@ def process_row(row: dict, ccis: CcisSession, runner: StacRunner, pdf_folder: Pa
     # CCIS first. Every search yields a PDF, either the case summary or the
     # printed no-results page, and either one goes on to STAC.
     if row["search_last"] != row["last_name"]:
-        logger.info(
-            "%s: searching CCIS for surname %r, with the suffix from %r dropped",
-            _describe(row), row["search_last"], row["last_name"],
-        )
+        logger.info("%s: searching CCIS with the surname's suffix dropped", _describe(row))
 
     # venire's insight: a compound name that returns nothing may be indexed
     # under only part of it. So a miss is retried with the other variants, and
@@ -225,8 +259,8 @@ def process_row(row: dict, ccis: CcisSession, runner: StacRunner, pdf_folder: Pa
     for matched_on, (first, last) in enumerate(variants):
         if matched_on:
             logger.info(
-                "%s: no CCIS record yet, trying %s, %s (search %d of %d)",
-                _describe(row), last, first, matched_on + 1, len(variants),
+                "%s: no CCIS record yet, trying name variant %d of %d",
+                _describe(row), matched_on + 1, len(variants),
             )
         # Counted before the search, so one that fails still counts. Read by
         # _summarise to show whether the extra searches are finding anything.
@@ -255,19 +289,21 @@ def process_row(row: dict, ccis: CcisSession, runner: StacRunner, pdf_folder: Pa
     has_record = result.has_record
     if has_record and matched_on:
         logger.info(
-            "%s: CCIS record found as %s, %s on search %d of %d, after the full name missed",
-            _describe(row), last, first, matched_on + 1, len(variants),
+            "%s: CCIS record found on name variant %d of %d, after the full name missed",
+            _describe(row), matched_on + 1, len(variants),
         )
 
     # Selenium uploads from a path, so the bytes have to land on disk.
     pdf_folder.mkdir(parents=True, exist_ok=True)
     pdf_file = pdf_path_for(pdf_folder, row, has_record)
     pdf_file.write_bytes(result.pdf_bytes)
+    # The folder, not the filename: the filename carries the person's name.
+    # It starts with the row number, which is how to find it.
     logger.info(
-        "%s: %s captured, %s KB -> %s",
+        "%s: %s captured, %s KB, saved in %s",
         _describe(row),
         "CCIS record" if has_record else "no-results page",
-        len(result.pdf_bytes) // 1024, pdf_file.name,
+        len(result.pdf_bytes) // 1024, pdf_folder.name,
     )
 
     # Then STAC. The PDF stays on disk either way: it is the audit trail, and
@@ -353,6 +389,7 @@ def check(config: dict, report: Path | None) -> int:
     cells = report_reader.read_xls(report)
     header_at, columns = report_reader.find_header(cells)
     rows = report_reader.build_rows(cells, header_at, columns)
+    _hide_from_logs(rows)
 
     problems = [row for row in rows if row["problem"]]
     todo = [row for row in rows if not row["problem"]]
@@ -371,12 +408,15 @@ def check(config: dict, report: Path | None) -> int:
             logger.warning("  row %s: %s", row["export_row"], row["problem"])
 
     if todo:
+        # Names and dates of birth are left out, as everywhere in the logs.
+        # To eyeball how the columns were read, inspect_export.py --show-rows
+        # prints them to the terminal without logging anything.
         logger.info("=== first rows that would be attempted ===")
         for row in todo[:CHECK_SAMPLE_ROWS]:
             logger.info(
-                "  row %s | %s, %s (CCIS surname %r) | dob %s | ucn %s | link %s",
-                row["export_row"], row["last_name"], row["first_name"],
-                row["search_last"], row["dob"], row["ucn"],
+                "  row %s | ucn %s | suffix dropped for CCIS: %s | link %s",
+                row["export_row"], row["ucn"],
+                "yes" if row["search_last"] != row["last_name"] else "no",
                 "yes" if row["case_url"] else "no",
             )
         if len(todo) > CHECK_SAMPLE_ROWS:
@@ -439,6 +479,7 @@ def run(config: dict, limit: int | None, only_row: int | None, report: Path | No
         logger.info("Using the export already downloaded: %s", report.name)
 
     working_copy, rows = report_reader.prepare_report(report)
+    _hide_from_logs(rows)
 
     # The report's links name the STAC it was run on. Filing may be on a
     # different instance with the same incident ids, so the links are pointed

@@ -39,7 +39,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
 from exceptions import RowProblem, SystemProblem
-from logger import get_logger
+from logger import get_logger, hide_names, hide_values
 
 logger = get_logger(__name__)
 
@@ -280,6 +280,11 @@ class CcisSession:
                 this person, so the row needs a look.
             SystemProblem: The browser or the session is broken.
         """
+        # main registers every row before searching. Done here as well so a
+        # search started any other way cannot put its name in the logs either.
+        hide_names([first_name, last_name])
+        hide_values([dob])
+
         try:
             self._search(first_name, last_name, dob)
 
@@ -297,8 +302,7 @@ class CcisSession:
             raise
         except TimeoutException as error:
             raise RowProblem(
-                f"CCIS did not respond as expected for {last_name}, {first_name} "
-                f"({dob}): {type(error).__name__}"
+                f"CCIS did not respond as expected to the search: {type(error).__name__}"
             ) from error
         except WebDriverException as error:
             # A dead driver is not this row's fault and the next row will fail
@@ -315,14 +319,15 @@ class CcisSession:
         for why they are clicked unconditionally.
         """
         # Logged per search, because "the names look swapped" is otherwise
-        # impossible to settle without watching the screen. This says exactly
-        # which value went into which field, by the field's own element id, so
-        # a real mix-up is visible in the log rather than inferred.
+        # impossible to settle without watching the screen. This says which
+        # field got which part, by the field's own element id, with each
+        # value's length in place of the value, so a mix-up still shows (the
+        # lengths trade places) without the name reaching the log.
         logger.info(
-            "CCIS search | %s <- %r | %s <- %r | dob %r",
-            self._at("last_name_field"), last_name,
-            self._at("first_name_field"), first_name,
-            dob,
+            "CCIS search | %s <- surname (%s chars) | %s <- first name (%s chars) | dob %s",
+            self._at("last_name_field"), len(last_name),
+            self._at("first_name_field"), len(first_name),
+            "filled" if dob else "blank",
         )
 
         self.driver.find_element(By.XPATH, self._at("exclude_attorneys_checkbox")).click()
