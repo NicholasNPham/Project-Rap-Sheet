@@ -130,11 +130,30 @@ PREVIEW_PANE_CSS = "#imageTabPageSplitterRightPane"
 PREVIEW_IFRAME_CSS = f"{PREVIEW_PANE_CSS} iframe.iframe-document"
 
 # Kendo's loading spinner. On 2026-10-26 live one covered Save for the whole
-# upload_timeout, and every row that failed that way had a preview loaded
-# before the upload. _upload removes the preview iframe, and DALYN found the
-# preview's own mask then stays up waiting for it. Whether that mask is the
-# one over Save here is what DESCRIBE_SPINNERS_JS is logged to find out.
+# upload_timeout. _upload removes the preview iframe, and DALYN found the
+# preview's own mask then stays up waiting for it. DESCRIBE_SPINNERS_JS
+# confirmed it on 2026-10-28: the spinner over Save sat in the preview pane's
+# k-loading-mask, on the rows whose preview was still loading when the iframe
+# went, and waiting the full minute never cleared it.
 SPINNER_CSS = ".k-loading-image"
+
+# Seconds Save may stay covered before a mask stranded in the preview pane is
+# taken away. A real preview finishes well inside this; one whose iframe has
+# been removed never does.
+PREVIEW_MASK_GRACE_SECONDS = 10
+
+# Removes the preview pane's loading masks, and its iframe again in case STAC
+# put one back. Only inside the preview pane: a mask anywhere else may be
+# STAC still working, and Save stays covered until it clears by itself.
+CLEAR_PREVIEW_MASK_JS = """
+var pane = document.querySelector(arguments[0]);
+if (!pane) { return 0; }
+var masks = pane.querySelectorAll('.k-loading-mask');
+for (var i = 0; i < masks.length; i++) { masks[i].remove(); }
+var frame = pane.querySelector('iframe.iframe-document');
+if (frame) { frame.remove(); }
+return masks.length;
+"""
 
 # Where each shown spinner sits, for the log when Save stays covered: its
 # parents by tag, id and class, whether it is inside the preview pane, and
@@ -1350,6 +1369,47 @@ class StacSession:
             f"var f=document.querySelector({PREVIEW_IFRAME_CSS!r}); if(f) f.remove();"
         )
 
+    def _clear_stranded_preview_mask(self, ucn: str) -> bool:
+        """Remove the preview pane's loading mask if it alone is covering Save.
+
+        _upload removes the preview iframe so it cannot take the Save click.
+        When that happens while the preview is still loading, the pane's
+        loading mask waits for an iframe that is gone and never clears. It is
+        only taken away when every spinner over Save is inside the preview
+        pane; one anywhere else may be STAC still working, and is left to
+        clear by itself.
+
+        Args:
+            ucn: For the log line.
+
+        Returns:
+            True if a mask was removed, False if there was nothing to remove,
+            something other than the preview covered Save, or the page could
+            not be read.
+
+        Raises:
+            Nothing. Save is pressed next either way, and its own wait reports
+            whatever still stands in the way.
+        """
+        try:
+            spinners = self.driver.execute_script(
+                DESCRIBE_SPINNERS_JS, SPINNER_CSS, SAVE_BUTTON_ID, PREVIEW_PANE_CSS
+            ) or []
+            covering = [spinner for spinner in spinners if spinner["covers_save"]]
+            if not covering or not all(spinner["preview"] for spinner in covering):
+                return False
+            removed = self.driver.execute_script(CLEAR_PREVIEW_MASK_JS, PREVIEW_PANE_CSS)
+        except WebDriverException as error:
+            logger.debug("Could not check the preview pane's mask: %s", type(error).__name__)
+            return False
+        if not removed:
+            return False
+        logger.info(
+            "%s: removed %s loading mask(s) stranded in the preview pane over Save",
+            ucn, removed,
+        )
+        return True
+
     def _describe_spinners(self) -> str:
         """Say where each shown spinner sits, for the log.
 
@@ -1828,10 +1888,15 @@ class StacSession:
             ) from error
 
         # A covered click never reaches the button, so nothing is saved and
-        # trying again is safe.
+        # trying again is safe. The click stays a real one throughout, so that
+        # stays true after a stranded preview mask has been cleared.
         press = PressWhenUncovered(SAVE_BUTTON_ID)
         try:
-            upload_wait.until(press)
+            try:
+                WebDriverWait(self.driver, PREVIEW_MASK_GRACE_SECONDS).until(press)
+            except TimeoutException:
+                self._clear_stranded_preview_mask(ucn)
+                upload_wait.until(press)
         except TimeoutException as error:
             logger.warning("%s: Save still covered; spinners: %s", ucn, self._describe_spinners())
             raise SystemProblem(f"Could not press Save: {press.blocker}.") from error
