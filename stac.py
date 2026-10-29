@@ -177,6 +177,38 @@ return Array.from(document.querySelectorAll(spinnerCss))
     return {chain: chain.join(' < '), preview: !!e.closest(paneCss), covers_save: covers};
   });
 """
+
+# What the page shows when Save was pressed and no confirmation came: the
+# Save button's state, any notification, validation mark or dialog that is
+# shown, and how many jQuery requests are still open. That last one tells a
+# slow save (still waiting on the server) from a refused one (nothing open).
+# Markup only, never page text, as with DESCRIBE_SPINNERS_JS.
+DESCRIBE_SAVE_STATE_JS = """
+var saveId = arguments[0];
+function shown(e) { return e.getClientRects().length > 0; }
+function label(e) {
+  return e.tagName.toLowerCase() + (e.id ? '#' + e.id : '')
+    + (e.classList.length ? '.' + Array.from(e.classList).slice(0, 3).join('.') : '');
+}
+function labels(css) {
+  return Array.from(document.querySelectorAll(css)).filter(shown).map(label).slice(0, 5);
+}
+var save = document.getElementById(saveId);
+var state = 'gone';
+if (save) {
+  state = !shown(save) ? 'hidden'
+    : (save.disabled || save.classList.contains('k-disabled')) ? 'disabled' : 'enabled';
+}
+return {
+  save: state,
+  notifications: labels("[class*='c-notification'], .k-notification"),
+  validation: labels(".field-validation-error, .validation-summary-errors, "
+    + ".input-validation-error, .k-invalid, .k-tooltip-validation"),
+  dialogs: labels(".k-window, .modal.show, [role='dialog']"),
+  requests: (window.jQuery && typeof jQuery.active === 'number') ? jQuery.active : null,
+  path: location.pathname
+};
+"""
 FILE_INPUT_CSS = (
     "input[id^='cipFileUpload_pagesImagesIndex-upload'][multiple]:not([webkitdirectory])"
 )
@@ -1438,6 +1470,45 @@ class StacSession:
             for s in spinners
         )
 
+    def _describe_save_state(self) -> str:
+        """Say what the page shows after Save went unconfirmed, for the log.
+
+        Digits are masked, since an element id or the page path can carry a
+        record number.
+
+        Returns:
+            One line naming the Save button's state, any shown notification,
+            validation mark or dialog, the open request count, and the page
+            path. A short note instead if the page could not be read.
+
+        Raises:
+            Nothing. It runs while another error is already on its way up,
+            and must not replace that error.
+        """
+        try:
+            state = self.driver.execute_script(DESCRIBE_SAVE_STATE_JS, SAVE_BUTTON_ID)
+        except WebDriverException as error:
+            return f"could not read the page ({type(error).__name__})"
+        if not isinstance(state, dict):
+            return "could not read the page (no answer)"
+
+        def masked(text: object) -> str:
+            """`text` with every run of digits replaced by #."""
+            return re.sub(r"[0-9]+", "#", str(text))
+
+        def listed(key: str) -> str:
+            """The shown elements under `key`, masked, or none."""
+            return masked(", ".join(state.get(key) or [])) or "none"
+
+        # The count is the page's own number, not markup, so it is not masked.
+        requests = state.get("requests")
+        return (
+            f"Save button {state.get('save')}; notifications: {listed('notifications')}; "
+            f"validation marks: {listed('validation')}; dialogs: {listed('dialogs')}; "
+            f"requests still open: {'unknown' if requests is None else requests}; "
+            f"page: {masked(state.get('path'))}"
+        )
+
     def _select_type_subtype(self) -> None:
         """Open the matrix dialog, select the run's Type/Subtype row, and verify.
 
@@ -1914,16 +1985,28 @@ class StacSession:
             ) from error
 
         # Past this line STAC may already have the document.
+        pressed_at = time.monotonic()
         try:
             upload_wait.until(
                 EC.presence_of_element_located((By.XPATH, SAVED_NOTIFICATION_XPATH))
             )
         except TimeoutException as error:
+            # Read before raising, while the page still shows whatever STAC
+            # answered with. It is the only record of why the save went quiet.
+            logger.warning(
+                "%s: no save confirmation after %ss. Page: %s. Spinners: %s",
+                ucn, self.upload_timeout, self._describe_save_state(),
+                self._describe_spinners(),
+            )
             raise SaveMayHaveHappened(
                 f"Pressed Save for {names} on {ucn} but STAC never confirmed. The rap "
                 "sheet may or may not be on the case. The next report will list it "
                 "again if it did not land."
             ) from error
+        # How close a good save comes to upload_timeout, to size that timeout.
+        logger.debug(
+            "%s: STAC confirmed the save after %.1fs", ucn, time.monotonic() - pressed_at
+        )
 
         # Wait for the notification to clear, or it covers the next row's Save
         # button.
