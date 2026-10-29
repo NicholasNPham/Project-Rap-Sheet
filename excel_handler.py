@@ -70,10 +70,10 @@ class Outcome:
     resuming work. Every value here is a terminal state: a run that sees one
     skips that row.
 
-    CHECK_BY_HAND is the dangerous one. It means Save was pressed and STAC
-    never confirmed, so the rap sheet may or may not be on the case. A rerun
-    must not touch that row, because filing it twice is the other way to get
-    this wrong.
+    CHECK_BY_HAND means Save was pressed and STAC never confirmed, so the rap
+    sheet may or may not be on the case. This working copy never retries it.
+    The next report decides: it lists only cases with no CRIM HIST image, so
+    the case comes back only if the save did not land.
     """
 
     FILED = "Filed in STAC"
@@ -96,7 +96,7 @@ class Outcome:
     NO_UCN = "No case number in this row"
     BAD_FORMAT = "Warning - could not read this row, check manually"
     STAC_PROBLEM = "Not filed - check manually"
-    CHECK_BY_HAND = "CHECK BY HAND - save unconfirmed, do not re-run"
+    CHECK_BY_HAND = "Save unconfirmed - next report retries it if it did not land"
     ERROR = "Error - check manually"
 
     #: Outcomes that mean the row is finished and must not be retried.

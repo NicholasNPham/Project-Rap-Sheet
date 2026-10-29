@@ -314,7 +314,7 @@ def process_row(row: dict, ccis: CcisSession, runner: StacRunner, pdf_folder: Pa
             row.get("case_url", ""),
         )
     except SaveMayHaveHappened as error:
-        # The one outcome that must never be retried.
+        # Never retried from this working copy. The next report decides.
         logger.error("%s: %s", _describe(row), error)
         return Outcome.CHECK_BY_HAND
     except RowProblem as error:
@@ -612,13 +612,16 @@ def watch(config: dict, limit: int | None) -> int:
     cost the 9:30 pass. Anything else ends the watch, through main's handlers:
     a ConfigProblem will not fix itself, and a bug would repeat every slot.
 
+    An unconfirmed save does not stop the watch either. The report lists only
+    cases with no CRIM HIST image, so a save that landed drops the case off
+    the next report, and one that did not brings it back to be filed again.
+
     Args:
         config: From load_config. Read once, so a config change needs a restart.
         limit: Passed to every pass, as with --limit.
 
     Returns:
-        EXIT_CHECK_BY_HAND if a pass left a save unconfirmed. The next pass
-        could file that rap sheet again, so the watch stops for a person.
+        Never returns normally. Ctrl+C or a non-SystemProblem error ends it.
     """
     while True:
         slot = next_slot(datetime.now())
@@ -633,11 +636,10 @@ def watch(config: dict, limit: int | None) -> int:
             continue
 
         if code == EXIT_CHECK_BY_HAND:
-            logger.error(
-                "Stopping the watch: a save was never confirmed. Check those cases "
-                "by hand, then start it again."
+            logger.warning(
+                "A save was never confirmed. Carrying on: the next report will list "
+                "that case again if the rap sheet did not land."
             )
-            return code
 
 
 def _summarise(rows: list, working_copy: Path) -> None:
@@ -665,10 +667,10 @@ def _summarise(rows: list, working_copy: Path) -> None:
 
     unconfirmed = counts.get(Outcome.CHECK_BY_HAND, 0)
     if unconfirmed:
-        logger.error(
-            "%s row(s) are marked %r. Save was pressed and STAC never confirmed, so "
-            "those rap sheets may or may not be on their cases. Check each one by "
-            "hand before running again.",
+        logger.warning(
+            "%s row(s) are marked %r. Save was pressed and STAC never confirmed. "
+            "The next report lists only cases still missing their rap sheet, so "
+            "any that did not land will be filed then.",
             unconfirmed, Outcome.CHECK_BY_HAND,
         )
 

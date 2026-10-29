@@ -1910,7 +1910,7 @@ class StacSession:
             raise SaveMayHaveHappened(
                 f"The browser failed while clicking Save for {names} on {ucn} "
                 f"({type(error).__name__}). The rap sheet may or may not be on the "
-                "case. Check it by hand; do not re-run this row."
+                "case. The next report will list it again if it did not land."
             ) from error
 
         # Past this line STAC may already have the document.
@@ -1921,8 +1921,8 @@ class StacSession:
         except TimeoutException as error:
             raise SaveMayHaveHappened(
                 f"Pressed Save for {names} on {ucn} but STAC never confirmed. The rap "
-                "sheet may or may not be on the case. Check it by hand; do not re-run "
-                "this row."
+                "sheet may or may not be on the case. The next report will list it "
+                "again if it did not land."
             ) from error
 
         # Wait for the notification to clear, or it covers the next row's Save
